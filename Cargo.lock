@@ -416,6 +416,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "reborrow"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
+
+[[package]]
 name = "redox_syscall"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -479,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "syncthreads"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aligned-vec",
  "core_affinity",
@@ -489,6 +495,7 @@ dependencies = [
  "parking_lot_core 0.9.10",
  "pollster",
  "rayon",
+ "reborrow",
  "threadpool",
  "threadpool_scope",
  "tokio",

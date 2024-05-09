@@ -5,10 +5,10 @@ use equator::assert;
 
 #[derive(Debug)]
 pub struct DynVec {
-    data: AVec<UnsafeCell<MaybeUninit<u8>>, aligned_vec::RuntimeAlign>,
-    sizeof: usize,
-    len: usize,
-    drop: unsafe fn(*mut (), usize),
+    pub(crate) data: AVec<UnsafeCell<MaybeUninit<u8>>, aligned_vec::RuntimeAlign>,
+    pub(crate) sizeof: usize,
+    pub(crate) len: usize,
+    pub(crate) drop: unsafe fn(*mut (), usize),
 }
 
 impl DynVec {
@@ -21,6 +21,8 @@ impl DynVec {
         }
     }
 
+    #[inline]
+    #[track_caller]
     pub unsafe fn assume_ref<T>(&self) -> &[T] {
         assert!(self.sizeof == core::mem::size_of::<T>());
         core::slice::from_raw_parts(self.data.as_ptr() as *const T, self.len)

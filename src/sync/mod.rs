@@ -1,10 +1,25 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use reborrow::*;
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
+
+#[derive(Copy, Clone, Debug)]
+pub struct BarrierParams {
+    pub spin_iters_before_park: usize,
+}
+impl Default for BarrierParams {
+    fn default() -> Self {
+        BarrierParams {
+            spin_iters_before_park: DEFAULT_SPIN_ITERS_BEFORE_PARK,
+        }
+    }
+}
+
+pub const DEFAULT_SPIN_ITERS_BEFORE_PARK: usize = 1 << 14;
 
 #[derive(Debug)]
 pub struct BarrierInit {
@@ -13,6 +28,7 @@ pub struct BarrierInit {
     gsense: AtomicBool,
     count: AtomicUsize,
     max: usize,
+    params: BarrierParams,
 }
 #[derive(Debug)]
 pub struct Barrier {
@@ -38,6 +54,7 @@ pub struct AdaBarrierInit {
     waiting_for_leader: AtomicBool,
     count_gsense: AtomicUsize,
     max: AtomicUsize,
+    params: BarrierParams,
 }
 #[derive(Debug)]
 pub struct AdaBarrier {
@@ -70,6 +87,7 @@ pub struct AsyncBarrierInit {
     max: usize,
     tids: Vec<AtomicUsize>,
     blocking: AtomicBool,
+    params: BarrierParams,
 }
 #[derive(Debug)]
 pub struct AsyncBarrierRef<'a> {
@@ -85,13 +103,14 @@ pub enum AsyncBarrierWaitResult {
 
 impl BarrierInit {
     #[inline]
-    pub fn new(num_threads: usize) -> Self {
+    pub fn new(num_threads: usize, params: BarrierParams) -> Self {
         Self {
             done: AtomicBool::new(false),
             waiting_for_leader: AtomicBool::new(false),
             count: AtomicUsize::new(num_threads),
             gsense: AtomicBool::new(false),
             max: num_threads,
+            params,
         }
     }
 
@@ -108,13 +127,14 @@ impl BarrierInit {
 
 impl AdaBarrierInit {
     #[inline]
-    pub fn new() -> Self {
+    pub fn new(params: BarrierParams) -> Self {
         Self {
             started: AtomicBool::new(false),
             done: AtomicBool::new(false),
             waiting_for_leader: AtomicBool::new(false),
             count_gsense: AtomicUsize::new(0),
             max: AtomicUsize::new(0),
+            params,
         }
     }
 
@@ -183,7 +203,7 @@ impl AdaBarrierInit {
 
 impl AsyncBarrierInit {
     #[inline]
-    pub fn new(num_threads: usize) -> Self {
+    pub fn new(num_threads: usize, params: BarrierParams) -> Self {
         Self {
             done: AtomicBool::new(false),
             waiting_for_leader: AtomicBool::new(false),
@@ -192,7 +212,13 @@ impl AsyncBarrierInit {
             max: num_threads,
             tids: (0..num_threads).map(|_| AtomicUsize::new(0)).collect(),
             blocking: AtomicBool::new(false),
+            params,
         }
+    }
+
+    #[inline]
+    pub fn num_threads(&self) -> usize {
+        self.max
     }
 
     pub fn barrier_ref(&self) -> AsyncBarrierRef<'_> {
@@ -227,7 +253,7 @@ macro_rules! impl_barrier {
                             return BarrierWaitResult::Dropped;
                         }
                         wait.spin();
-                        if iters >= 16 {
+                        if iters >= self.init.params.spin_iters_before_park {
                             unsafe {
                                 parking_lot_core::park(
                                     addr,
@@ -265,7 +291,7 @@ macro_rules! impl_barrier {
                 let mut iters = 0usize;
                 while self.init.waiting_for_leader.load(SeqCst) {
                     wait.spin();
-                    if iters >= 16 {
+                    if iters >= self.init.params.spin_iters_before_park {
                         unsafe {
                             parking_lot_core::park(
                                 addr,
@@ -316,7 +342,7 @@ macro_rules! impl_ada_barrier {
                         };
                         wait.spin();
 
-                        if iters >= 16 {
+                        if iters >= self.init.params.spin_iters_before_park {
                             unsafe {
                                 parking_lot_core::park(
                                     addr,
@@ -359,7 +385,7 @@ macro_rules! impl_ada_barrier {
                 let mut iters = 0usize;
                 while self.init.waiting_for_leader.load(SeqCst) {
                     wait.spin();
-                    if iters >= 16 {
+                    if iters >= self.init.params.spin_iters_before_park {
                         unsafe {
                             parking_lot_core::park(
                                 addr,
@@ -384,7 +410,24 @@ macro_rules! impl_ada_barrier {
     };
 }
 
+impl<'short> ReborrowMut<'short> for AsyncBarrierRef<'_> {
+    type Target = AsyncBarrierRef<'short>;
+
+    #[inline]
+    fn rb_mut(&'short mut self) -> Self::Target {
+        AsyncBarrierRef {
+            init: self.init,
+            lsense: self.lsense,
+        }
+    }
+}
+
 impl AsyncBarrierRef<'_> {
+    #[inline]
+    pub fn num_threads(&self) -> usize {
+        self.init.max
+    }
+
     #[inline(never)]
     pub async fn wait(&mut self) -> AsyncBarrierWaitResult {
         self.lsense = !self.lsense;
@@ -459,7 +502,7 @@ impl AsyncBarrierRef<'_> {
                         return AsyncBarrierWaitResult::Dropped;
                     }
                     wait.spin();
-                    if iters >= 16 {
+                    if iters >= self.init.params.spin_iters_before_park {
                         unsafe {
                             parking_lot_core::park(
                                 addr,
@@ -529,7 +572,7 @@ impl AsyncBarrierRef<'_> {
             let mut iters = 0usize;
             while self.init.waiting_for_leader.load(SeqCst) {
                 wait.spin();
-                if iters >= 16 {
+                if iters >= self.init.params.spin_iters_before_park {
                     unsafe {
                         parking_lot_core::park(
                             addr,
