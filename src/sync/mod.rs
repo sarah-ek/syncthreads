@@ -152,22 +152,42 @@ impl AdaBarrierInit {
 macro_rules! impl_barrier {
     ($bar: ty) => {
         impl $bar {
+            #[inline(never)]
             pub fn wait(&mut self) -> BarrierWaitResult {
                 self.lsense = !self.lsense;
+                let addr: &BarrierInit = &*self.init;
+                let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
 
-                if self.init.count.fetch_sub(1, SeqCst) == 1 {
+                if (self.init.count.fetch_sub(1, SeqCst)) == 1 {
                     let max = self.init.max;
                     self.init.waiting_for_leader.store(true, SeqCst);
                     self.init.count.store(max, SeqCst);
                     self.init.gsense.store(self.lsense, SeqCst);
+                    unsafe {
+                        parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN)
+                    };
                     BarrierWaitResult::Leader
                 } else {
                     let mut wait = parking_lot_core::SpinWait::new();
+                    let mut iters = 0;
                     while self.init.gsense.load(SeqCst) != self.lsense {
                         if self.init.done.load(SeqCst) {
                             return BarrierWaitResult::Dropped;
                         }
                         wait.spin();
+                        if iters >= 16 {
+                            unsafe {
+                                parking_lot_core::park(
+                                    addr,
+                                    || self.init.gsense.load(SeqCst) != self.lsense,
+                                    || {},
+                                    |_, _| {},
+                                    parking_lot_core::DEFAULT_PARK_TOKEN,
+                                    None,
+                                );
+                            }
+                        };
+                        iters += 1;
                     }
                     BarrierWaitResult::Follower
                 }
@@ -176,12 +196,36 @@ macro_rules! impl_barrier {
             #[inline]
             pub fn lead(&self) {
                 self.init.waiting_for_leader.store(false, SeqCst);
+
+                let addr: &BarrierInit = &*self.init;
+                let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
+                unsafe {
+                    parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN)
+                };
             }
 
+            #[inline(never)]
             pub fn follow(&self) {
+                let addr: &BarrierInit = &*self.init;
+                let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
+
                 let mut wait = parking_lot_core::SpinWait::new();
+                let mut iters = 0;
                 while self.init.waiting_for_leader.load(SeqCst) {
                     wait.spin();
+                    if iters >= 16 {
+                        unsafe {
+                            parking_lot_core::park(
+                                addr,
+                                || self.init.waiting_for_leader.load(SeqCst),
+                                || {},
+                                |_, _| {},
+                                parking_lot_core::DEFAULT_PARK_TOKEN,
+                                None,
+                            )
+                        };
+                    }
+                    iters += 1;
                 }
             }
         }
@@ -190,8 +234,12 @@ macro_rules! impl_barrier {
 macro_rules! impl_ada_barrier {
     ($bar: ty) => {
         impl $bar {
+            #[inline(never)]
             pub fn wait(&mut self) -> AdaBarrierWaitResult {
                 self.lsense = !self.lsense;
+                let addr: &AdaBarrierInit = &*self.init;
+                let addr =
+                    unsafe { core::mem::transmute::<_, usize>(addr as *const AdaBarrierInit) };
 
                 if self.init.count_gsense.fetch_sub(1, SeqCst) & !(1usize << (usize::BITS - 1)) == 1
                 {
@@ -200,16 +248,38 @@ macro_rules! impl_ada_barrier {
                     self.init
                         .count_gsense
                         .store(max | ((self.lsense as usize) << (usize::BITS - 1)), SeqCst);
+                    unsafe {
+                        parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN)
+                    };
                     AdaBarrierWaitResult::Leader { num_threads: max }
                 } else {
                     let mut wait = parking_lot_core::SpinWait::new();
+                    let mut iters = 0;
                     while (self.init.count_gsense.load(SeqCst) >> (usize::BITS - 1) != 0)
                         != self.lsense
                     {
                         if self.init.done.load(SeqCst) {
                             return AdaBarrierWaitResult::Dropped;
-                        }
+                        };
                         wait.spin();
+
+                        if iters >= 16 {
+                            unsafe {
+                                parking_lot_core::park(
+                                    addr,
+                                    || {
+                                        (self.init.count_gsense.load(SeqCst) >> (usize::BITS - 1)
+                                            != 0)
+                                            != self.lsense
+                                    },
+                                    || {},
+                                    |_, _| {},
+                                    parking_lot_core::DEFAULT_PARK_TOKEN,
+                                    None,
+                                );
+                            }
+                        }
+                        iters += 1;
                     }
                     AdaBarrierWaitResult::Follower
                 }
@@ -217,12 +287,38 @@ macro_rules! impl_ada_barrier {
 
             pub fn lead(&self) {
                 self.init.waiting_for_leader.store(false, SeqCst);
+
+                let addr: &AdaBarrierInit = &*self.init;
+                let addr =
+                    unsafe { core::mem::transmute::<_, usize>(addr as *const AdaBarrierInit) };
+                unsafe {
+                    parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN)
+                };
             }
 
+            #[inline(never)]
             pub fn follow(&self) {
+                let addr: &AdaBarrierInit = &*self.init;
+                let addr =
+                    unsafe { core::mem::transmute::<_, usize>(addr as *const AdaBarrierInit) };
+
                 let mut wait = parking_lot_core::SpinWait::new();
+                let mut iters = 0;
                 while self.init.waiting_for_leader.load(SeqCst) {
                     wait.spin();
+                    if iters >= 16 {
+                        unsafe {
+                            parking_lot_core::park(
+                                addr,
+                                || self.init.waiting_for_leader.load(SeqCst),
+                                || {},
+                                |_, _| {},
+                                parking_lot_core::DEFAULT_PARK_TOKEN,
+                                None,
+                            )
+                        };
+                    }
+                    iters += 1;
                 }
             }
         }

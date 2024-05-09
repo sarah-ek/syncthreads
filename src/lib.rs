@@ -505,6 +505,17 @@ mod tests {
     }
 
     #[test]
+    fn oversubscription() {
+        use rayon::prelude::*;
+
+        (0..6).into_par_iter().for_each(|_| test_barrier_rayon());
+        (0..6)
+            .into_par_iter()
+            .for_each(|_| test_ada_barrier_rayon());
+        (0..6).into_par_iter().for_each(|_| test_seq());
+    }
+
+    #[test]
     fn test_barrier_rayon() {
         let n = N;
         let nthreads = 6;
