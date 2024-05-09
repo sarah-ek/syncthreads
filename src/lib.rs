@@ -1,4 +1,5 @@
 use core::cell::UnsafeCell;
+use core::fmt;
 use core::marker::PhantomData;
 use core::sync::atomic::AtomicUsize;
 use crossbeam::utils::CachePadded;
@@ -16,7 +17,7 @@ struct Invariant<'brand> {
     __invariant: PhantomData<fn(&'brand ()) -> &'brand ()>,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 pub struct ThreadCount<'brand> {
     inner: usize,
     __marker: PhantomData<Invariant<'brand>>,
@@ -36,10 +37,26 @@ impl ThreadCount<'_> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 pub struct ThreadId<'brand> {
     inner: usize,
     __no_sync_marker: PhantomData<(*mut (), Invariant<'brand>)>,
+}
+
+impl fmt::Debug for ThreadId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadId")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ThreadCount<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadCount")
+            .field("inner", &self.inner)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -78,6 +95,23 @@ pub struct AdaBarrier<'brand, 'a, T> {
     exclusive: &'a UnsafeCell<DynVec>,
     id: ThreadId<'brand>,
 }
+#[derive(Debug)]
+pub struct AsyncBarrierInit<'brand, T> {
+    inner: sync::AsyncBarrierInit,
+    data: UnsafeCell<T>,
+    shared: UnsafeCell<DynVec>,
+    exclusive: UnsafeCell<DynVec>,
+    tid: AtomicUsize,
+    __marker: PhantomData<Invariant<'brand>>,
+}
+#[derive(Debug)]
+pub struct AsyncBarrier<'brand, 'a, T> {
+    inner: sync::AsyncBarrierRef<'a>,
+    data: &'a UnsafeCell<T>,
+    shared: &'a UnsafeCell<DynVec>,
+    exclusive: &'a UnsafeCell<DynVec>,
+    id: ThreadId<'brand>,
+}
 
 unsafe impl<T: Sync + Send> Sync for BarrierInit<'_, T> {}
 unsafe impl<T: Sync + Send> Send for BarrierInit<'_, T> {}
@@ -88,6 +122,11 @@ unsafe impl<T: Sync + Send> Sync for AdaBarrierInit<'_, T> {}
 unsafe impl<T: Sync + Send> Send for AdaBarrierInit<'_, T> {}
 unsafe impl<T: Sync + Send> Sync for AdaBarrier<'_, '_, T> {}
 unsafe impl<T: Sync + Send> Send for AdaBarrier<'_, '_, T> {}
+
+unsafe impl<T: Sync + Send> Sync for AsyncBarrierInit<'_, T> {}
+unsafe impl<T: Sync + Send> Send for AsyncBarrierInit<'_, T> {}
+unsafe impl<T: Sync + Send> Sync for AsyncBarrier<'_, '_, T> {}
+unsafe impl<T: Sync + Send> Send for AsyncBarrier<'_, '_, T> {}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct AllocHint {
@@ -163,6 +202,29 @@ pub fn with_adaptive_barrier_init<T, R>(
     })
 }
 
+#[inline]
+pub fn with_async_barrier_init<T, R>(
+    value: T,
+    num_threads: usize,
+    hint: AllocHint,
+    f: impl for<'brand> FnOnce(AsyncBarrierInit<'brand, T>) -> R,
+) -> R {
+    f(AsyncBarrierInit {
+        inner: sync::AsyncBarrierInit::new(num_threads),
+        data: UnsafeCell::new(value),
+        shared: UnsafeCell::new(DynVec::with_capacity(
+            hint.shared.align_bytes,
+            hint.shared.size_bytes,
+        )),
+        exclusive: UnsafeCell::new(DynVec::with_capacity(
+            hint.exclusive.align_bytes,
+            hint.exclusive.size_bytes,
+        )),
+        tid: AtomicUsize::new(0),
+        __marker: PhantomData,
+    })
+}
+
 impl<'brand, T> BarrierInit<'brand, T> {
     pub fn into_inner(self) -> T {
         self.data.into_inner()
@@ -190,6 +252,25 @@ impl<'brand, T> AdaBarrierInit<'brand, T> {
 
     pub fn barrier_ref(&self) -> AdaBarrier<'brand, '_, T> {
         AdaBarrier {
+            inner: self.inner.barrier_ref(),
+            data: &self.data,
+            shared: &self.shared,
+            exclusive: &self.exclusive,
+            id: ThreadId {
+                inner: self.tid.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                __no_sync_marker: PhantomData,
+            },
+        }
+    }
+}
+
+impl<'brand, T> AsyncBarrierInit<'brand, T> {
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+
+    pub fn barrier_ref(&self) -> AsyncBarrier<'brand, '_, T> {
+        AsyncBarrier {
             inner: self.inner.barrier_ref(),
             data: &self.data,
             shared: &self.shared,
@@ -241,14 +322,14 @@ impl<'brand, 'a, T> Barrier<'brand, 'a, T> {
 impl<'brand, 'a, T> AdaBarrier<'brand, 'a, T> {
     pub fn sync<'b, Shared, Exclusive, I: IntoIterator<Item = Exclusive>>(
         &'b mut self,
-        f: impl FnOnce(&'a mut T) -> (Shared, I),
+        f: impl FnOnce(usize, &'a mut T) -> (Shared, I),
     ) -> Option<(&'b Shared, &'b mut Exclusive, ThreadId<'b>, ThreadCount<'b>)> {
         match self.inner.wait() {
             sync::AdaBarrierWaitResult::Leader { num_threads } => {
                 let exclusive = unsafe { &mut *self.exclusive.get() };
                 let shared = unsafe { &mut *self.shared.get() };
 
-                let f = f(unsafe { &mut *self.data.get() });
+                let f = f(num_threads, unsafe { &mut *self.data.get() });
                 shared.collect(core::iter::once((num_threads, f.0)));
                 exclusive.collect(f.1.into_iter().map(UnsafeCell::new).map(CachePadded::new));
                 self.inner.lead();
@@ -278,13 +359,43 @@ impl<'brand, 'a, T> AdaBarrier<'brand, 'a, T> {
     }
 }
 
+impl<'brand, 'a, T> AsyncBarrier<'brand, 'a, T> {
+    pub async fn sync<'b, Shared: 'b, Exclusive: 'b, I: IntoIterator<Item = Exclusive>>(
+        &'b mut self,
+        f: impl FnOnce(&'a mut T) -> (Shared, I),
+    ) -> Option<(&'b Shared, &'b mut Exclusive)> {
+        match self.inner.wait().await {
+            sync::AsyncBarrierWaitResult::Leader => {
+                let exclusive = unsafe { &mut *self.exclusive.get() };
+                let shared = unsafe { &mut *self.shared.get() };
+
+                let f = f(unsafe { &mut *self.data.get() });
+                shared.collect(core::iter::once(f.0));
+                exclusive.collect(f.1.into_iter().map(UnsafeCell::new).map(CachePadded::new));
+                self.inner.lead();
+            }
+            sync::AsyncBarrierWaitResult::Follower => {
+                self.inner.follow().await;
+            }
+            sync::AsyncBarrierWaitResult::Dropped => return None,
+        }
+        let shared = &unsafe { (&*self.shared.get()).assume_ref::<Shared>() }[0];
+        Some((shared, unsafe {
+            &mut *((&*self.exclusive.get()).assume_ref::<CachePadded<UnsafeCell<Exclusive>>>()
+                [self.id.inner]
+                .get())
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{iter, with_adaptive_barrier_init, with_barrier_init};
+    use super::*;
     use core_affinity::CoreId;
+    use futures::future::join_all;
 
     const N: usize = 100000;
-    const ITERS: usize = 1;
+    const ITERS: usize = 20;
     const SAMPLES: usize = 1;
 
     fn default<T: Default>() -> T {
@@ -409,7 +520,7 @@ mod tests {
 
                                 loop {
                                     let Some((&(i, head), mine, _id, _nthreads)) =
-                                        barrier.sync(|(phase, x)| {
+                                        barrier.sync(|nthreads, (phase, x)| {
                                             let i = match phase {
                                                 Phase::Init => {
                                                     *phase = Phase::Iter(0);
@@ -450,7 +561,14 @@ mod tests {
         let x = &mut *vec![1.0; n];
         let nthreads = 6;
 
-        let pool = threadpool::ThreadPool::new(6);
+        let pool = threadpool::ThreadPool::new(nthreads);
+        for tid in 0..nthreads {
+            pool.execute(move || {
+                core_affinity::set_for_current(CoreId { id: tid });
+                std::thread::sleep(std::time::Duration::from_secs_f64(0.1));
+            });
+        }
+        pool.join();
 
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
@@ -469,7 +587,7 @@ mod tests {
 
                                 loop {
                                     let Some((&(i, head), mine, _id, _nthreads)) =
-                                        barrier.sync(|(phase, x)| {
+                                        barrier.sync(|nthreads, (phase, x)| {
                                             let i = match phase {
                                                 Phase::Init => {
                                                     *phase = Phase::Iter(0);
@@ -508,10 +626,51 @@ mod tests {
     fn oversubscription() {
         use rayon::prelude::*;
 
+        dbg!("tokio");
+        static TID: AtomicUsize = AtomicUsize::new(0);
+        {
+            let runtime = &tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(6)
+                .on_thread_start(|| {
+                    core_affinity::set_for_current(CoreId {
+                        id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    });
+                })
+                .build()
+                .unwrap();
+            tokio_scoped::scoped(runtime.handle()).scope(|scope| {
+                for _ in 0..6 {
+                    scope.spawn(async move {
+                        with_runtime(runtime);
+                    });
+                }
+            });
+        }
+        dbg!("tokio");
+        (0..6).into_par_iter().for_each(|_| {
+            let runtime = &tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(6)
+                .on_thread_start(|| {
+                    core_affinity::set_for_current(CoreId {
+                        id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    });
+                })
+                .build()
+                .unwrap();
+            tokio_scoped::scoped(runtime.handle()).scope(|scope| {
+                scope.spawn(async move {
+                    with_runtime(runtime);
+                });
+            });
+        });
+
+        dbg!("rayon");
         (0..6).into_par_iter().for_each(|_| test_barrier_rayon());
+        dbg!("ada rayon");
         (0..6)
             .into_par_iter()
             .for_each(|_| test_ada_barrier_rayon());
+        dbg!("seq");
         (0..6).into_par_iter().for_each(|_| test_seq());
     }
 
@@ -606,6 +765,102 @@ mod tests {
                         *x += head;
                     }
                 }
+            }
+            dbg!(now.elapsed());
+        }
+    }
+
+    #[test]
+    fn test_tokio() {
+        static TID: AtomicUsize = AtomicUsize::new(0);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(6)
+            .on_thread_start(|| {
+                core_affinity::set_for_current(CoreId {
+                    id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                });
+            })
+            .build()
+            .unwrap();
+        with_runtime(&runtime);
+    }
+
+    fn with_runtime(runtime: &tokio::runtime::Runtime) {
+        let nthreads = 6;
+
+        for _ in 0..SAMPLES {
+            let now = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let n = N;
+                let x = &mut *vec![1.0; n];
+
+                with_async_barrier_init(&mut *x, nthreads, AllocHint::default(), |init| {
+                    tokio_scoped::scoped(runtime.handle()).scope(|scope| {
+                        for _ in 0..nthreads {
+                            scope.spawn(async {
+                                let mut barrier = init.barrier_ref();
+
+                                for i in 0..n / 2 {
+                                    let Some((head, mine)) = barrier
+                                        .sync(|x| {
+                                            let (head, x) = x[i..].split_at_mut(1);
+                                            (head[0], iter::split_mut(x, nthreads))
+                                        })
+                                        .await
+                                    else {
+                                        break;
+                                    };
+
+                                    let head = *head;
+                                    let mine = &mut **mine;
+
+                                    for x in mine.iter_mut() {
+                                        *x += head;
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+            dbg!(now.elapsed());
+        }
+    }
+
+    #[test]
+    fn test_pollster() {
+        let nthreads = 6;
+
+        for _ in 0..SAMPLES {
+            let now = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let n = N;
+                let x = &mut *vec![1.0; n];
+
+                with_async_barrier_init(&mut *x, nthreads, AllocHint::default(), |init| {
+                    pollster::block_on(join_all((0..nthreads).map(|_| async {
+                        let mut barrier = init.barrier_ref();
+
+                        for i in 0..n / 2 {
+                            let Some((head, mine)) = barrier
+                                .sync(|x| {
+                                    let (head, x) = x[i..].split_at_mut(1);
+                                    (head[0], iter::split_mut(x, nthreads))
+                                })
+                                .await
+                            else {
+                                break;
+                            };
+
+                            let head = *head;
+                            let mine = &mut **mine;
+
+                            for x in mine.iter_mut() {
+                                *x += head;
+                            }
+                        }
+                    })));
+                });
             }
             dbg!(now.elapsed());
         }
