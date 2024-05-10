@@ -410,18 +410,6 @@ macro_rules! impl_ada_barrier {
     };
 }
 
-impl<'short> ReborrowMut<'short> for AsyncBarrierRef<'_> {
-    type Target = AsyncBarrierRef<'short>;
-
-    #[inline]
-    fn rb_mut(&'short mut self) -> Self::Target {
-        AsyncBarrierRef {
-            init: self.init,
-            lsense: self.lsense,
-        }
-    }
-}
-
 impl AsyncBarrierRef<'_> {
     #[inline]
     pub fn num_threads(&self) -> usize {
@@ -605,3 +593,39 @@ impl_ada_barrier!(AdaBarrier);
 impl_ada_barrier!(AdaBarrierRef<'_>);
 impl_barrier!(Barrier);
 impl_barrier!(BarrierRef<'_>);
+
+impl<'short> ReborrowMut<'short> for BarrierRef<'_> {
+    type Target = BarrierRef<'short>;
+
+    #[inline]
+    fn rb_mut(&'short mut self) -> Self::Target {
+        BarrierRef {
+            init: self.init,
+            lsense: self.lsense,
+        }
+    }
+}
+
+impl<'short> ReborrowMut<'short> for AdaBarrierRef<'_> {
+    type Target = AdaBarrierRef<'short>;
+
+    #[inline]
+    fn rb_mut(&'short mut self) -> Self::Target {
+        AdaBarrierRef {
+            init: self.init,
+            lsense: self.lsense,
+        }
+    }
+}
+
+impl<'short> ReborrowMut<'short> for AsyncBarrierRef<'_> {
+    type Target = AsyncBarrierRef<'short>;
+
+    #[inline]
+    fn rb_mut(&'short mut self) -> Self::Target {
+        AsyncBarrierRef {
+            init: self.init,
+            lsense: self.lsense,
+        }
+    }
+}

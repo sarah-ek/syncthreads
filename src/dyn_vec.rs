@@ -1,14 +1,23 @@
 use aligned_vec::AVec;
 use core::cell::UnsafeCell;
+use core::fmt;
 use core::mem::MaybeUninit;
 use equator::assert;
 
-#[derive(Debug)]
 pub struct DynVec {
     pub(crate) data: AVec<UnsafeCell<MaybeUninit<u8>>, aligned_vec::RuntimeAlign>,
     pub(crate) sizeof: usize,
     pub(crate) len: usize,
     pub(crate) drop: unsafe fn(*mut (), usize),
+}
+
+impl fmt::Debug for DynVec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynVec")
+            .field("len", &self.len)
+            .field("sizeof", &self.sizeof)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DynVec {
