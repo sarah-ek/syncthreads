@@ -524,7 +524,7 @@ mod tests {
     use core_affinity::CoreId;
     use futures::future::join_all;
 
-    const N: usize = 10;
+    const N: usize = 100000;
     const ITERS: usize = 1;
     const SAMPLES: usize = 1;
 
@@ -536,7 +536,7 @@ mod tests {
     fn test_barrier() {
         let n = N;
         let x = &mut *vec![1.0; n];
-        let nthreads = 6;
+        let nthreads = rayon::current_num_threads();
 
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn test_barrier_threadpool() {
         let n = N;
-        let nthreads = 6;
+        let nthreads = rayon::current_num_threads();
         let pool = threadpool::ThreadPool::new(nthreads);
         for tid in 0..nthreads {
             pool.execute(move || {
@@ -592,7 +592,7 @@ mod tests {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
-                let nthreads = 6;
+                let nthreads = rayon::current_num_threads();
                 with_barrier_init(&mut *x, nthreads, default(), |init, nthreads| {
                     let init = &init;
                     threadpool_scope::scope_with(&pool, |scope| {
@@ -627,7 +627,7 @@ mod tests {
     fn test_ada_barrier_rayon() {
         let n = N;
         let x = &mut *vec![1.0; n];
-        let nthreads = 6;
+        let nthreads = rayon::current_num_threads();
 
         let pool = rayon::ThreadPoolBuilder::new()
             .start_handler(|tid| {
@@ -693,7 +693,7 @@ mod tests {
     fn test_ada_barrier_threadpool() {
         let n = N;
         let x = &mut *vec![1.0; n];
-        let nthreads = 6;
+        let nthreads = rayon::current_num_threads();
 
         let pool = threadpool::ThreadPool::new(nthreads);
         for tid in 0..nthreads {
@@ -764,7 +764,7 @@ mod tests {
         static TID: AtomicUsize = AtomicUsize::new(0);
         {
             let runtime = &tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(6)
+                .worker_threads(rayon::current_num_threads())
                 .on_thread_start(|| {
                     core_affinity::set_for_current(CoreId {
                         id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -773,7 +773,7 @@ mod tests {
                 .build()
                 .unwrap();
             tokio_scoped::scoped(runtime.handle()).scope(|scope| {
-                for _ in 0..6 {
+                for _ in 0..rayon::current_num_threads() {
                     scope.spawn(async move {
                         with_runtime(runtime);
                     });
@@ -781,37 +781,43 @@ mod tests {
             });
         }
         dbg!("tokio");
-        (0..6).into_par_iter().for_each(|_| {
-            let runtime = &tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(6)
-                .on_thread_start(|| {
-                    core_affinity::set_for_current(CoreId {
-                        id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .for_each(|_| {
+                let runtime = &tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(rayon::current_num_threads())
+                    .on_thread_start(|| {
+                        core_affinity::set_for_current(CoreId {
+                            id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        });
+                    })
+                    .build()
+                    .unwrap();
+                tokio_scoped::scoped(runtime.handle()).scope(|scope| {
+                    scope.spawn(async move {
+                        with_runtime(runtime);
                     });
-                })
-                .build()
-                .unwrap();
-            tokio_scoped::scoped(runtime.handle()).scope(|scope| {
-                scope.spawn(async move {
-                    with_runtime(runtime);
                 });
             });
-        });
 
         dbg!("rayon");
-        (0..6).into_par_iter().for_each(|_| test_barrier_rayon());
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .for_each(|_| test_barrier_rayon());
         dbg!("ada rayon");
-        (0..6)
+        (0..rayon::current_num_threads())
             .into_par_iter()
             .for_each(|_| test_ada_barrier_rayon());
         dbg!("seq");
-        (0..6).into_par_iter().for_each(|_| test_seq());
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .for_each(|_| test_seq());
     }
 
     #[test]
     fn test_barrier_rayon() {
         let n = N;
-        let nthreads = 6;
+        let nthreads = rayon::current_num_threads();
 
         let pool = rayon::ThreadPoolBuilder::new()
             .start_handler(|tid| {
@@ -910,7 +916,7 @@ mod tests {
     fn test_tokio() {
         static TID: AtomicUsize = AtomicUsize::new(0);
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(6)
+            .worker_threads(rayon::current_num_threads())
             .on_thread_start(|| {
                 core_affinity::set_for_current(CoreId {
                     id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -922,7 +928,7 @@ mod tests {
     }
 
     fn with_runtime(runtime: &tokio::runtime::Runtime) {
-        let nthreads = 6;
+        let nthreads = rayon::current_num_threads();
 
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
@@ -962,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_pollster() {
-        let nthreads = 6;
+        let nthreads = rayon::current_num_threads();
 
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
