@@ -8,18 +8,25 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct BarrierParams {
-    pub spin_iters_before_park: usize,
+    pub spin_iters_before_park: SpinIters,
 }
-impl Default for BarrierParams {
-    fn default() -> Self {
-        BarrierParams {
-            spin_iters_before_park: DEFAULT_SPIN_ITERS_BEFORE_PARK,
-        }
-    }
+#[derive(Copy, Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct AsyncBarrierParams {
+    pub spin_iters_before_park: SpinIters,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct SpinIters(pub usize);
+
+impl Default for SpinIters {
+    fn default() -> Self {
+        Self(DEFAULT_SPIN_ITERS_BEFORE_PARK)
+    }
+}
 const SHIFT: u32 = usize::BITS - 1;
 const HIGH_BIT: usize = 1 << SHIFT;
 const LOW_MASK: usize = !HIGH_BIT;
@@ -87,7 +94,7 @@ pub struct AsyncBarrierInit {
     wait_wakers: [SegQueue<Waker>; 2],
     follow_wakers: [SegQueue<Waker>; 2],
     max: usize,
-    params: BarrierParams,
+    params: AsyncBarrierParams,
 }
 #[derive(Debug)]
 pub struct AsyncBarrierRef<'a> {
@@ -208,7 +215,7 @@ impl AdaBarrierInit {
 
 impl AsyncBarrierInit {
     #[inline]
-    pub fn new(num_threads: usize, params: BarrierParams) -> Self {
+    pub fn new(num_threads: usize, params: AsyncBarrierParams) -> Self {
         Self {
             done: AtomicBool::new(false),
             waiting_for_leader: AtomicUsize::new(0),
@@ -258,7 +265,7 @@ macro_rules! impl_barrier {
                             return BarrierWaitResult::Dropped;
                         }
                         wait.spin();
-                        if iters >= self.init.params.spin_iters_before_park {
+                        if iters >= self.init.params.spin_iters_before_park.0 {
                             unsafe {
                                 parking_lot_core::park(
                                     addr,
@@ -296,7 +303,7 @@ macro_rules! impl_barrier {
                 let mut iters = 0usize;
                 while self.init.waiting_for_leader.load(SeqCst) {
                     wait.spin();
-                    if iters >= self.init.params.spin_iters_before_park {
+                    if iters >= self.init.params.spin_iters_before_park.0 {
                         unsafe {
                             parking_lot_core::park(
                                 addr,
@@ -344,7 +351,7 @@ macro_rules! impl_ada_barrier {
                         };
                         wait.spin();
 
-                        if iters >= self.init.params.spin_iters_before_park {
+                        if iters >= self.init.params.spin_iters_before_park.0 {
                             unsafe {
                                 parking_lot_core::park(
                                     addr,
@@ -386,7 +393,7 @@ macro_rules! impl_ada_barrier {
                 let mut iters = 0usize;
                 while self.init.waiting_for_leader.load(SeqCst) {
                     wait.spin();
-                    if iters >= self.init.params.spin_iters_before_park {
+                    if iters >= self.init.params.spin_iters_before_park.0 {
                         unsafe {
                             parking_lot_core::park(
                                 addr,
@@ -445,7 +452,7 @@ impl AsyncBarrierRef<'_> {
                 lsense: bool,
                 wakers: &'a SegQueue<Waker>,
                 iters: usize,
-                params: &'a BarrierParams,
+                params: &'a AsyncBarrierParams,
             }
 
             impl Future for Wait<'_> {
@@ -457,7 +464,7 @@ impl AsyncBarrierRef<'_> {
                     let iter = self.iters;
                     self.iters += 1;
 
-                    if iter < self.params.spin_iters_before_park {
+                    if iter < self.params.spin_iters_before_park.0 {
                         if gsense >> SHIFT != lsense {
                             if self.done.load(SeqCst) {
                                 Poll::Ready(true)
@@ -529,7 +536,7 @@ impl AsyncBarrierRef<'_> {
             waiting_for_leader: &'a AtomicUsize,
             wakers: &'a SegQueue<Waker>,
             iters: usize,
-            params: &'a BarrierParams,
+            params: &'a AsyncBarrierParams,
         }
 
         impl Future for Wait<'_> {
@@ -539,7 +546,7 @@ impl AsyncBarrierRef<'_> {
                 let iter = self.iters;
                 self.iters += 1;
                 let mut waiting_for_leader = self.waiting_for_leader.load(SeqCst);
-                if iter < self.params.spin_iters_before_park {
+                if iter < self.params.spin_iters_before_park.0 {
                     if waiting_for_leader >> SHIFT == 1 {
                         cx.waker().wake_by_ref();
                         Poll::Pending

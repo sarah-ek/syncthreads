@@ -11,6 +11,7 @@ pub mod sync;
 
 mod dyn_vec;
 use dyn_vec::DynVec;
+use sync::{AsyncBarrierParams, BarrierParams};
 
 #[derive(Debug)]
 pub struct BarrierInit<T> {
@@ -109,9 +110,9 @@ impl Default for Alloc {
 }
 
 impl<T> BarrierInit<T> {
-    pub fn new(value: T, num_threads: usize, hint: AllocHint) -> Self {
+    pub fn new(value: T, num_threads: usize, hint: AllocHint, params: BarrierParams) -> Self {
         BarrierInit {
-            inner: sync::BarrierInit::new(num_threads, Default::default()),
+            inner: sync::BarrierInit::new(num_threads, params),
             data: UnsafeCell::new(value),
             ctx: UnsafeCell::new(hint.ctx.make_vec()),
             shared: UnsafeCell::new(hint.shared.make_vec()),
@@ -164,9 +165,9 @@ impl<T> BarrierInit<T> {
 }
 
 impl<T> AsyncBarrierInit<T> {
-    pub fn new(value: T, num_threads: usize, hint: AllocHint) -> Self {
+    pub fn new(value: T, num_threads: usize, hint: AllocHint, params: AsyncBarrierParams) -> Self {
         AsyncBarrierInit {
-            inner: sync::AsyncBarrierInit::new(num_threads, Default::default()),
+            inner: sync::AsyncBarrierInit::new(num_threads, params),
             data: UnsafeCell::new(value),
             ctx: UnsafeCell::new({
                 let mut v = hint.ctx.make_vec();
@@ -510,7 +511,7 @@ mod tests {
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
-                let init = BarrierInit::new(&mut *x, nthreads, default());
+                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
                 std::thread::scope(|s| {
                     for _ in 0..nthreads {
                         s.spawn(|| {
@@ -558,7 +559,7 @@ mod tests {
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
                 let nthreads = rayon::current_num_threads();
-                let init = BarrierInit::new(&mut *x, nthreads, default());
+                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
                 threadpool_scope::scope_with(&pool, |scope| {
                     for _ in 0..nthreads {
                         scope.execute(|| {
@@ -655,7 +656,7 @@ mod tests {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
-                let init = BarrierInit::new(&mut *x, nthreads, default());
+                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
                 pool.in_place_scope(|s| {
                     for _ in 0..nthreads {
                         s.spawn(|_| {
@@ -755,7 +756,8 @@ mod tests {
                 let n = N;
                 let x = &mut *vec![1.0; n];
 
-                let init = AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default());
+                let init =
+                    AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), default());
                 tokio_scoped::scoped(runtime.handle()).scope(|scope| {
                     for _ in 0..nthreads {
                         scope.spawn(async {
@@ -794,7 +796,8 @@ mod tests {
                 let n = N;
                 let x = &mut *vec![1.0; n];
 
-                let init = AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default());
+                let init =
+                    AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), default());
                 pollster::block_on(join_all((0..nthreads).map(|_| async {
                     let mut barrier = init.barrier_ref();
 
@@ -830,7 +833,8 @@ mod tests {
                 let n = N;
                 let x = &mut *vec![1.0; n];
 
-                let init = AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default());
+                let init =
+                    AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), default());
                 pollster::block_on(join_all((0..nthreads).map(|_| async {
                     let mut barrier = init.barrier_ref();
 

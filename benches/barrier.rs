@@ -63,7 +63,7 @@ fn barrier(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default());
+        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default(), Default::default());
 
         rayon::in_place_scope(|s| {
             for _ in 0..nthreads {
@@ -109,7 +109,8 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
     let x = &mut *vec![1.0; n];
 
     bencher.bench(|| {
-        let init = AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default());
+        let init =
+            AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), Default::default());
         tokio_scoped::scoped(runtime.handle()).scope(|scope| {
             for _ in 0..nthreads {
                 scope.spawn(async {
