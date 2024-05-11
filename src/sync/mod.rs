@@ -32,6 +32,7 @@ const HIGH_BIT: usize = 1 << SHIFT;
 const LOW_MASK: usize = !HIGH_BIT;
 
 pub const DEFAULT_SPIN_ITERS_BEFORE_PARK: usize = 1 << 14;
+const DEFAULT_SPIN_ITERS_BEFORE_SLEEPY: usize = 16;
 
 #[derive(Debug)]
 pub struct BarrierInit {
@@ -469,6 +470,9 @@ impl AsyncBarrierRef<'_> {
                             if self.done.load(SeqCst) {
                                 Poll::Ready(true)
                             } else {
+                                if iter >= DEFAULT_SPIN_ITERS_BEFORE_SLEEPY {
+                                    std::thread::yield_now();
+                                }
                                 cx.waker().wake_by_ref();
                                 Poll::Pending
                             }
@@ -548,6 +552,9 @@ impl AsyncBarrierRef<'_> {
                 let mut waiting_for_leader = self.waiting_for_leader.load(SeqCst);
                 if iter < self.params.spin_iters_before_park.0 {
                     if waiting_for_leader >> SHIFT == 1 {
+                        if iter >= DEFAULT_SPIN_ITERS_BEFORE_SLEEPY {
+                            std::thread::yield_now();
+                        }
                         cx.waker().wake_by_ref();
                         Poll::Pending
                     } else {
