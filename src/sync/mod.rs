@@ -266,8 +266,13 @@ macro_rules! impl_barrier {
                 } else {
                     let mut wait = parking_lot_core::SpinWait::new();
                     let mut iters = 0usize;
-                    while self.init.gsense.load(SeqCst) != self.lsense {
-                        if self.init.done.load(SeqCst) {
+                    loop {
+                        let done = self.init.done.load(SeqCst);
+                        let keep_going = self.init.gsense.load(SeqCst) != self.lsense;
+                        if !keep_going {
+                            break;
+                        }
+                        if done {
                             return BarrierWaitResult::Dropped;
                         }
                         wait.spin();
@@ -351,8 +356,14 @@ macro_rules! impl_ada_barrier {
                 } else {
                     let mut wait = parking_lot_core::SpinWait::new();
                     let mut iters = 0usize;
-                    while self.init.count_gsense.load(SeqCst) >> SHIFT != self.lsense as usize {
-                        if self.init.done.load(SeqCst) {
+                    loop {
+                        let done = self.init.done.load(SeqCst);
+                        let keep_going =
+                            self.init.count_gsense.load(SeqCst) >> SHIFT != self.lsense as usize;
+                        if !keep_going {
+                            break;
+                        }
+                        if done {
                             return AdaBarrierWaitResult::Dropped;
                         };
                         wait.spin();
@@ -466,13 +477,14 @@ impl AsyncBarrierRef<'_> {
 
                 fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                     let lsense = self.lsense as usize;
+                    let mut done = self.done.load(SeqCst);
                     let mut gsense = self.gsense.load(SeqCst);
                     let iter = self.iters;
                     self.iters += 1;
 
                     if iter < self.params.spin_iters_before_park.0 {
                         if gsense >> SHIFT != lsense {
-                            if self.done.load(SeqCst) {
+                            if done {
                                 Poll::Ready(true)
                             } else {
                                 if iter >= DEFAULT_SPIN_ITERS_BEFORE_SLEEPY {
@@ -489,9 +501,6 @@ impl AsyncBarrierRef<'_> {
                             if gsense >> SHIFT == lsense {
                                 return Poll::Ready(false);
                             }
-                            if self.done.load(SeqCst) {
-                                return Poll::Ready(true);
-                            }
 
                             match self.gsense.compare_exchange_weak(
                                 gsense,
@@ -500,10 +509,16 @@ impl AsyncBarrierRef<'_> {
                                 SeqCst,
                             ) {
                                 Ok(_) => {
+                                    if done {
+                                        return Poll::Ready(true);
+                                    }
                                     self.wakers.push(cx.waker().clone());
                                     return Poll::Pending;
                                 }
-                                Err(new) => gsense = new,
+                                Err(new) => {
+                                    done = self.done.load(SeqCst);
+                                    gsense = new;
+                                }
                             }
                         }
                     }

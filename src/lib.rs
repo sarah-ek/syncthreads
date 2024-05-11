@@ -37,7 +37,7 @@
 //!
 //!                     (head[0], iter::split_mut(x, nthreads))
 //!                 }) else {
-//!                     break;
+//!                     panic!();
 //!                 };
 //!
 //!                 let head = *head;
@@ -55,9 +55,9 @@
 //!     assert_eq!(x[i], 2.0f64.powi(i as _));
 //! }
 //! ```
-use core::{cell::UnsafeCell, fmt, marker::PhantomData, sync::atomic::AtomicUsize};
+use core::{cell::UnsafeCell, fmt, sync::atomic::AtomicUsize};
 use crossbeam::utils::CachePadded;
-use reborrow::*;
+use std::sync::atomic::AtomicBool;
 
 extern crate alloc;
 
@@ -88,7 +88,6 @@ impl std::error::Error for DropError {}
 pub struct BarrierInit<T> {
     inner: sync::BarrierInit,
     data: UnsafeCell<T>,
-    ctx: UnsafeCell<DynVec>,
     shared: UnsafeCell<DynVec>,
     exclusive: UnsafeCell<DynVec>,
     tid: AtomicUsize,
@@ -97,22 +96,19 @@ pub struct BarrierInit<T> {
 
 /// Synchronous barrier for cooperation between multiple independent threads.
 #[derive(Debug)]
-pub struct Barrier<'a, T, Ctx = ()> {
+pub struct Barrier<'a, T> {
     inner: sync::BarrierRef<'a>,
     data: &'a UnsafeCell<T>,
-    ctx: &'a UnsafeCell<DynVec>,
     shared: &'a UnsafeCell<DynVec>,
     exclusive: &'a UnsafeCell<DynVec>,
     tid: usize,
     tag: &'a UnsafeCell<pretty::TypeId>,
-    __marker: PhantomData<&'a UnsafeCell<Ctx>>,
 }
 /// Structure used to initialize instances of [`AsyncBarrier`].
 #[derive(Debug)]
 pub struct AsyncBarrierInit<T> {
     inner: sync::AsyncBarrierInit,
     data: UnsafeCell<T>,
-    ctx: UnsafeCell<DynVec>,
     shared: UnsafeCell<DynVec>,
     exclusive: UnsafeCell<DynVec>,
     tid: AtomicUsize,
@@ -121,15 +117,13 @@ pub struct AsyncBarrierInit<T> {
 
 /// Synchronous barrier for cooperation between multiple independent tasks.
 #[derive(Debug)]
-pub struct AsyncBarrier<'a, T, Ctx = ()> {
+pub struct AsyncBarrier<'a, T> {
     inner: sync::AsyncBarrierRef<'a>,
     data: &'a UnsafeCell<T>,
-    ctx: &'a UnsafeCell<DynVec>,
     shared: &'a UnsafeCell<DynVec>,
     exclusive: &'a UnsafeCell<DynVec>,
     tid: usize,
     tag: &'a UnsafeCell<pretty::TypeId>,
-    __marker: PhantomData<&'a UnsafeCell<Ctx>>,
 }
 
 unsafe impl<T: Sync + Send> Sync for BarrierInit<T> {}
@@ -139,15 +133,70 @@ unsafe impl<T: Sync + Send> Send for Barrier<'_, T> {}
 
 unsafe impl<T: Sync + Send> Sync for AsyncBarrierInit<T> {}
 unsafe impl<T: Sync + Send> Send for AsyncBarrierInit<T> {}
-unsafe impl<T: Sync + Send, Ctx: Sync + Send> Sync for AsyncBarrier<'_, T, Ctx> {}
-unsafe impl<T: Sync + Send, Ctx: Sync + Send> Send for AsyncBarrier<'_, T, Ctx> {}
+unsafe impl<T: Sync + Send> Sync for AsyncBarrier<'_, T> {}
+unsafe impl<T: Sync + Send> Send for AsyncBarrier<'_, T> {}
+
+pub struct Shared<T> {
+    taken: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+pub struct Guard<'a, T> {
+    taken: &'a AtomicBool,
+    value: &'a mut T,
+}
+
+impl<T> Drop for Guard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        self.taken
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl<T> core::ops::Deref for Guard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.value
+    }
+}
+
+impl<T> core::ops::DerefMut for Guard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value
+    }
+}
+
+impl<T> Shared<T> {
+    #[inline]
+    pub fn new(value: T) -> Self {
+        Self {
+            taken: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    #[inline]
+    pub fn lock(&self) -> Guard<'_, T> {
+        let taken = self
+            .taken
+            .fetch_or(true, std::sync::atomic::Ordering::Relaxed);
+        equator::assert!(!taken);
+        Guard {
+            taken: &self.taken,
+            value: unsafe { &mut *self.value.get() },
+        }
+    }
+}
 
 /// Allocation hint provided to barrier initializers.
 #[derive(Debug, Default)]
 pub struct AllocHint {
     pub shared: Alloc,
     pub exclusive: Alloc,
-    pub ctx: Alloc,
 }
 
 /// Pre-allocated storage.
@@ -199,7 +248,6 @@ impl<T> BarrierInit<T> {
         BarrierInit {
             inner: sync::BarrierInit::new(num_threads, params),
             data: UnsafeCell::new(value),
-            ctx: UnsafeCell::new(hint.ctx.make_vec()),
             shared: UnsafeCell::new(hint.shared.make_vec()),
             exclusive: UnsafeCell::new(hint.exclusive.make_vec()),
             tid: AtomicUsize::new(0),
@@ -218,9 +266,6 @@ impl<T> BarrierInit<T> {
                 exclusive: Alloc::Storage(Storage {
                     alloc: self.exclusive.into_inner(),
                 }),
-                ctx: Alloc::Storage(Storage {
-                    alloc: self.ctx.into_inner(),
-                }),
             },
         )
     }
@@ -236,12 +281,10 @@ impl<T> BarrierInit<T> {
         Barrier {
             inner: self.inner.barrier_ref(),
             data: &self.data,
-            ctx: &self.ctx,
             shared: &self.shared,
             exclusive: &self.exclusive,
             tid,
             tag: &self.tag,
-            __marker: PhantomData,
         }
     }
 
@@ -264,11 +307,6 @@ impl<T> AsyncBarrierInit<T> {
         AsyncBarrierInit {
             inner: sync::AsyncBarrierInit::new(num_threads, params),
             data: UnsafeCell::new(value),
-            ctx: UnsafeCell::new({
-                let mut v = hint.ctx.make_vec();
-                v.collect(core::iter::once(UnsafeCell::new(())));
-                v
-            }),
             shared: UnsafeCell::new(hint.shared.make_vec()),
             exclusive: UnsafeCell::new(hint.exclusive.make_vec()),
             tid: AtomicUsize::new(0),
@@ -287,9 +325,6 @@ impl<T> AsyncBarrierInit<T> {
                 exclusive: Alloc::Storage(Storage {
                     alloc: self.exclusive.into_inner(),
                 }),
-                ctx: Alloc::Storage(Storage {
-                    alloc: self.ctx.into_inner(),
-                }),
             },
         )
     }
@@ -305,12 +340,10 @@ impl<T> AsyncBarrierInit<T> {
         AsyncBarrier {
             inner: self.inner.barrier_ref(),
             data: &self.data,
-            ctx: &self.ctx,
             shared: &self.shared,
             exclusive: &self.exclusive,
             tid,
             tag: &self.tag,
-            __marker: PhantomData,
         }
     }
 
@@ -326,7 +359,7 @@ impl<T> AsyncBarrierInit<T> {
     }
 }
 
-impl<'a, T, Ctx> Barrier<'a, T, Ctx> {
+impl<'a, T> Barrier<'a, T> {
     /// Waits until `self.num_threads()` threads have called this function, at which point the last
     /// thread to arrive will call `f` with a reference to the data, splitting it into a shared
     /// section and mutable section. These are respectively sent to the other threads through a
@@ -375,54 +408,6 @@ impl<'a, T, Ctx> Barrier<'a, T, Ctx> {
         ))
     }
 
-    /// Waits until `self.num_threads()` threads have called this function, at which point the last
-    /// thread to arrive will call `f` with the context of the group, and store the resulting value
-    /// as the new context.
-    ///
-    /// # Safety
-    /// Threads from the same group that wait at this function at the same time must agree on the
-    /// same types for `NewCtx`, and the type of `tag`.
-    pub unsafe fn map_blocking<NewCtx: 'a>(
-        self,
-        f: impl FnOnce(Ctx) -> NewCtx,
-        tag: impl core::any::Any,
-    ) -> Result<Barrier<'a, T, NewCtx>, DropError> {
-        let mut this = self;
-        let tag = type_id_of_val(&tag);
-        match this.inner.wait() {
-            sync::BarrierWaitResult::Leader => {
-                let ctx_vec = unsafe { &mut *this.ctx.get() };
-                let ctx = unsafe {
-                    core::ptr::from_ref(&ctx_vec.assume_ref::<UnsafeCell<Ctx>>()[0]).read()
-                };
-                ctx_vec.len = 0;
-
-                let ctx = f(ctx.into_inner());
-                ctx_vec.collect(core::iter::once(UnsafeCell::new(ctx)));
-
-                unsafe { *this.tag.get() = tag };
-                this.inner.lead();
-            }
-            sync::BarrierWaitResult::Follower => {
-                this.inner.follow();
-            }
-            sync::BarrierWaitResult::Dropped => return Err(DropError),
-        }
-        let this_tag = unsafe { *this.tag.get() };
-        equator::assert!(tag == this_tag);
-
-        Ok(Barrier::<'a, T, NewCtx> {
-            inner: this.inner,
-            data: this.data,
-            ctx: this.ctx,
-            shared: this.shared,
-            exclusive: this.exclusive,
-            tid: this.tid,
-            tag: this.tag,
-            __marker: PhantomData,
-        })
-    }
-
     /// Returns the unique (among the barriers created by the same initializer) id of `self`, which
     /// is a value between `0` and `self.num_threads()`.
     #[inline]
@@ -437,7 +422,7 @@ impl<'a, T, Ctx> Barrier<'a, T, Ctx> {
     }
 }
 
-impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
+impl<'a, T> AsyncBarrier<'a, T> {
     /// Waits until `self.num_threads()` threads have called this function, at which point the last
     /// thread to arrive will call `f` with a reference to the data, splitting it into a shared
     /// section and mutable section. These are respectively sent to the other threads through a
@@ -453,7 +438,7 @@ impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
         I: IntoIterator<Item = Exclusive>,
     >(
         &'b mut self,
-        f: impl FnOnce(&'a mut T, &'a mut Ctx) -> (Shared, I),
+        f: impl FnOnce(&'a mut T) -> (Shared, I),
         tag: impl core::any::Any,
     ) -> Result<(&'b Shared, &'b mut Exclusive), DropError> {
         let tag = type_id_of_val(&tag);
@@ -461,11 +446,8 @@ impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
             sync::AsyncBarrierWaitResult::Leader => {
                 let exclusive = unsafe { &mut *self.exclusive.get() };
                 let shared = unsafe { &mut *self.shared.get() };
-                let ctx = unsafe { &*self.ctx.get() };
 
-                let f = f(unsafe { &mut *self.data.get() }, unsafe {
-                    &mut *((&ctx.assume_ref::<UnsafeCell<Ctx>>()[0]).get())
-                });
+                let f = f(unsafe { &mut *self.data.get() });
                 shared.collect(core::iter::once(f.0));
                 exclusive.collect(f.1.into_iter().map(UnsafeCell::new).map(CachePadded::new));
                 unsafe { *self.tag.get() = tag };
@@ -488,54 +470,6 @@ impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
         }))
     }
 
-    /// Waits until `self.num_threads()` threads have called this function, at which point the last
-    /// thread to arrive will call `f` with the context of the group, and store the resulting value
-    /// as the new context.
-    ///
-    /// # Safety
-    /// Threads from the same group that wait at this function at the same time must agree on the
-    /// same types for `NewCtx`, and the type of `tag`.
-    pub async unsafe fn map<NewCtx: 'a>(
-        self,
-        f: impl FnOnce(Ctx) -> NewCtx,
-        tag: impl core::any::Any,
-    ) -> Result<AsyncBarrier<'a, T, NewCtx>, DropError> {
-        let mut this = self;
-        let tag = type_id_of_val(&tag);
-        match this.inner.wait().await {
-            sync::AsyncBarrierWaitResult::Leader => {
-                let ctx_vec = unsafe { &mut *this.ctx.get() };
-                let ctx = unsafe {
-                    core::ptr::from_ref(&ctx_vec.assume_ref::<UnsafeCell<Ctx>>()[0]).read()
-                };
-                ctx_vec.len = 0;
-
-                let ctx = f(ctx.into_inner());
-                ctx_vec.collect(core::iter::once(UnsafeCell::new(ctx)));
-
-                unsafe { *this.tag.get() = tag };
-                this.inner.lead();
-            }
-            sync::AsyncBarrierWaitResult::Follower => {
-                this.inner.follow().await;
-            }
-            sync::AsyncBarrierWaitResult::Dropped => return Err(DropError),
-        }
-        let this_tag = unsafe { *this.tag.get() };
-        equator::assert!(tag == this_tag);
-
-        Ok(AsyncBarrier::<'a, T, NewCtx> {
-            inner: this.inner,
-            data: this.data,
-            ctx: this.ctx,
-            shared: this.shared,
-            exclusive: this.exclusive,
-            tid: this.tid,
-            tag: this.tag,
-            __marker: PhantomData,
-        })
-    }
-
     /// Returns the unique (among the barriers created by the same initializer) id of `self`, which
     /// is a value between `0` and `self.num_threads()`.
     #[inline]
@@ -547,42 +481,6 @@ impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
     #[inline]
     pub fn thread_count(&self) -> usize {
         self.inner.num_threads()
-    }
-}
-
-impl<'short, T, Ctx> ReborrowMut<'short> for Barrier<'_, T, Ctx> {
-    type Target = Barrier<'short, T, Ctx>;
-
-    #[inline]
-    fn rb_mut(&'short mut self) -> Self::Target {
-        Barrier {
-            inner: self.inner.rb_mut(),
-            data: self.data,
-            ctx: self.ctx,
-            shared: self.shared,
-            exclusive: self.exclusive,
-            tid: self.tid,
-            tag: self.tag,
-            __marker: PhantomData,
-        }
-    }
-}
-
-impl<'short, T, Ctx> ReborrowMut<'short> for AsyncBarrier<'_, T, Ctx> {
-    type Target = AsyncBarrier<'short, T, Ctx>;
-
-    #[inline]
-    fn rb_mut(&'short mut self) -> Self::Target {
-        AsyncBarrier {
-            inner: self.inner.rb_mut(),
-            data: self.data,
-            ctx: self.ctx,
-            shared: self.shared,
-            exclusive: self.exclusive,
-            tid: self.tid,
-            tag: self.tag,
-            __marker: PhantomData,
-        }
     }
 }
 
@@ -695,7 +593,7 @@ mod tests {
 
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
-                                    break;
+                                    panic!();
                                 };
 
                                 let head = *head;
@@ -742,7 +640,7 @@ mod tests {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
-                                    break;
+                                    panic!();
                                 };
                                 let mine = &mut **mine;
                                 for x in mine.iter_mut() {
@@ -839,7 +737,7 @@ mod tests {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
-                                    break;
+                                    panic!();
                                 };
 
                                 let head = *head;
@@ -936,11 +834,11 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Ok((head, mine)) = sync_await!(barrier, |x, ()| {
+                                let Ok((head, mine)) = sync_await!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
-                                    break;
+                                    panic!();
                                 };
 
                                 let head = *head;
@@ -974,11 +872,11 @@ mod tests {
                     let mut barrier = init.barrier_ref();
 
                     for i in 0..n / 2 {
-                        let Ok((head, mine)) = sync_await!(barrier, |x, ()| {
+                        let Ok((head, mine)) = sync_await!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], iter::split_mut(x, nthreads))
                         }) else {
-                            break;
+                            panic!();
                         };
 
                         let head = *head;
@@ -1012,11 +910,11 @@ mod tests {
 
                     for i in 0..n / 2 {
                         if barrier.thread_id() == 0 {
-                            let Ok((head, mine)) = sync_await!(barrier, |x, ()| {
+                            let Ok((head, mine)) = sync_await!(barrier, |x| {
                                 let (head, x) = x[i..].split_at_mut(1);
                                 (head[0], iter::split_mut(x, nthreads))
                             }) else {
-                                break;
+                                panic!();
                             };
 
                             let head = *head;
@@ -1026,11 +924,11 @@ mod tests {
                                 *x += head;
                             }
                         } else {
-                            let Ok((head, mine)) = sync_await!(barrier, |x, ()| {
+                            let Ok((head, mine)) = sync_await!(barrier, |x| {
                                 let (head, x) = x[i..].split_at_mut(1);
                                 (head[0], iter::split_mut(x, nthreads))
                             }) else {
-                                break;
+                                panic!();
                             };
 
                             let head = *head;
