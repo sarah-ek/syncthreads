@@ -1,5 +1,5 @@
 `syncthreads` is a library providing synchronous and asynchronous barrier types.
-These can be constructed using [`BarrierInit`] and [`AsyncBarrierInit`].
+These can be constructed using `BarrierInit` and `AsyncBarrierInit`.
 
 # Example
 Sequential code:
