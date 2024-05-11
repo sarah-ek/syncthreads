@@ -71,7 +71,7 @@ fn barrier(bencher: Bencher, PlotArg(n): PlotArg) {
                     let mut barrier = init.barrier_ref();
 
                     for i in 0..n / 2 {
-                        let Some((head, mine)) = syncthreads::sync_blocking!(barrier, |x| {
+                        let Ok((head, mine)) = syncthreads::sync_blocking!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], syncthreads::iter::split_mut(x, nthreads))
                         }) else {
@@ -117,7 +117,7 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
                     let mut barrier = init.barrier_ref();
 
                     for i in 0..n / 2 {
-                        let Some((head, mine)) = syncthreads::sync_await!(barrier, |x, ()| {
+                        let Ok((head, mine)) = syncthreads::sync_await!(barrier, |x, ()| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], syncthreads::iter::split_mut(x, nthreads))
                         }) else {

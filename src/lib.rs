@@ -13,6 +13,8 @@ mod dyn_vec;
 use dyn_vec::DynVec;
 use sync::{AsyncBarrierParams, BarrierParams};
 
+/// Error indicating that one of the barriers in a group was dropped while the others are still
+/// waiting.
 #[derive(Copy, Clone, Debug)]
 pub struct DropError;
 
@@ -285,7 +287,7 @@ impl<'a, T, Ctx> Barrier<'a, T, Ctx> {
         &'b mut self,
         f: impl FnOnce(&'a mut T) -> (Shared, I),
         tag: impl core::any::Any,
-    ) -> Option<(&'b Shared, &'b mut Exclusive)> {
+    ) -> Result<(&'b Shared, &'b mut Exclusive), DropError> {
         let tag = type_id_of_val(&tag);
         match self.inner.wait() {
             sync::BarrierWaitResult::Leader => {
@@ -301,12 +303,12 @@ impl<'a, T, Ctx> Barrier<'a, T, Ctx> {
             sync::BarrierWaitResult::Follower => {
                 self.inner.follow();
             }
-            sync::BarrierWaitResult::Dropped => return None,
+            sync::BarrierWaitResult::Dropped => return Err(DropError),
         }
         let self_tag = unsafe { *self.tag.get() };
         equator::assert!(tag == self_tag);
 
-        Some((
+        Ok((
             unsafe { &(&*self.shared.get()).assume_ref::<Shared>()[0] },
             unsafe {
                 &mut *((&*self.exclusive.get()).assume_ref::<CachePadded<UnsafeCell<Exclusive>>>()
@@ -327,7 +329,7 @@ impl<'a, T, Ctx> Barrier<'a, T, Ctx> {
         self,
         f: impl FnOnce(Ctx) -> NewCtx,
         tag: impl core::any::Any,
-    ) -> Option<Barrier<'a, T, NewCtx>> {
+    ) -> Result<Barrier<'a, T, NewCtx>, DropError> {
         let mut this = self;
         let tag = type_id_of_val(&tag);
         match this.inner.wait() {
@@ -347,12 +349,12 @@ impl<'a, T, Ctx> Barrier<'a, T, Ctx> {
             sync::BarrierWaitResult::Follower => {
                 this.inner.follow();
             }
-            sync::BarrierWaitResult::Dropped => return None,
+            sync::BarrierWaitResult::Dropped => return Err(DropError),
         }
         let this_tag = unsafe { *this.tag.get() };
         equator::assert!(tag == this_tag);
 
-        Some(Barrier::<'a, T, NewCtx> {
+        Ok(Barrier::<'a, T, NewCtx> {
             inner: this.inner,
             data: this.data,
             ctx: this.ctx,
@@ -396,7 +398,7 @@ impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
         &'b mut self,
         f: impl FnOnce(&'a mut T, &'a mut Ctx) -> (Shared, I),
         tag: impl core::any::Any,
-    ) -> Option<(&'b Shared, &'b mut Exclusive)> {
+    ) -> Result<(&'b Shared, &'b mut Exclusive), DropError> {
         let tag = type_id_of_val(&tag);
         match self.inner.wait().await {
             sync::AsyncBarrierWaitResult::Leader => {
@@ -415,14 +417,14 @@ impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
             sync::AsyncBarrierWaitResult::Follower => {
                 self.inner.follow().await;
             }
-            sync::AsyncBarrierWaitResult::Dropped => return None,
+            sync::AsyncBarrierWaitResult::Dropped => return Err(DropError),
         }
 
         let self_tag = unsafe { *self.tag.get() };
         equator::assert!(tag == self_tag);
 
         let shared = &unsafe { (&*self.shared.get()).assume_ref::<Shared>() }[0];
-        Some((shared, unsafe {
+        Ok((shared, unsafe {
             &mut *((&*self.exclusive.get()).assume_ref::<CachePadded<UnsafeCell<Exclusive>>>()
                 [self.tid]
                 .get())
@@ -440,7 +442,7 @@ impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
         self,
         f: impl FnOnce(Ctx) -> NewCtx,
         tag: impl core::any::Any,
-    ) -> Option<AsyncBarrier<'a, T, NewCtx>> {
+    ) -> Result<AsyncBarrier<'a, T, NewCtx>, DropError> {
         let mut this = self;
         let tag = type_id_of_val(&tag);
         match this.inner.wait().await {
@@ -460,12 +462,12 @@ impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
             sync::AsyncBarrierWaitResult::Follower => {
                 this.inner.follow().await;
             }
-            sync::AsyncBarrierWaitResult::Dropped => return None,
+            sync::AsyncBarrierWaitResult::Dropped => return Err(DropError),
         }
         let this_tag = unsafe { *this.tag.get() };
         equator::assert!(tag == this_tag);
 
-        Some(AsyncBarrier::<'a, T, NewCtx> {
+        Ok(AsyncBarrier::<'a, T, NewCtx> {
             inner: this.inner,
             data: this.data,
             ctx: this.ctx,
@@ -534,6 +536,7 @@ fn type_id_of_val<T: 'static>(_: &T) -> pretty::TypeId {
     }
 }
 
+/// Safe wrapper around [`AsyncBarrier::sync`].
 #[macro_export]
 macro_rules! sync_await {
     ($bar: expr, $f:expr) => {{
@@ -543,6 +546,7 @@ macro_rules! sync_await {
     }};
 }
 
+/// Safe wrapper around [`Barrier::sync_blocking`].
 #[macro_export]
 macro_rules! sync_blocking {
     ($bar: expr, $f:expr) => {{
@@ -552,20 +556,22 @@ macro_rules! sync_blocking {
     }};
 }
 
+/// Safe wrapper around [`AsyncBarrier::map`].
 #[macro_export]
-macro_rules! map_mut_await {
+macro_rules! map_await {
     ($bar: expr, $f:expr) => {{
         #[allow(unused_unsafe)]
-        let x = unsafe { ($bar).map_mut($f, || {}).await };
+        let x = unsafe { ($bar).map($f, || {}).await };
         x
     }};
 }
 
+/// Safe wrapper around [`Barrier::map_blocking`].
 #[macro_export]
-macro_rules! map_mut_blocking {
+macro_rules! map_blocking {
     ($bar: expr, $f:expr) => {{
         #[allow(unused_unsafe)]
-        let x = unsafe { ($bar).map_mut_blocking($f, || {}) };
+        let x = unsafe { ($bar).map_blocking($f, || {}) };
         x
     }};
 }
@@ -627,7 +633,7 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Some((head, data)) = sync_blocking!(barrier, |x| {
+                                let Ok((head, data)) = sync_blocking!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
 
                                     (head[0], iter::split_mut(x, nthreads))
@@ -675,7 +681,7 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Some((&head, mine)) = sync_blocking!(barrier, |x| {
+                                let Ok((&head, mine)) = sync_blocking!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
@@ -772,7 +778,7 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Some((head, mine)) = sync_blocking!(barrier, |x| {
+                                let Ok((head, mine)) = sync_blocking!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
@@ -873,7 +879,7 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Some((head, mine)) = sync_await!(barrier, |x, ()| {
+                                let Ok((head, mine)) = sync_await!(barrier, |x, ()| {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
@@ -911,7 +917,7 @@ mod tests {
                     let mut barrier = init.barrier_ref();
 
                     for i in 0..n / 2 {
-                        let Some((head, mine)) = sync_await!(barrier, |x, ()| {
+                        let Ok((head, mine)) = sync_await!(barrier, |x, ()| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], iter::split_mut(x, nthreads))
                         }) else {
@@ -949,7 +955,7 @@ mod tests {
 
                     for i in 0..n / 2 {
                         if barrier.thread_id() == 0 {
-                            let Some((head, mine)) = sync_await!(barrier, |x, ()| {
+                            let Ok((head, mine)) = sync_await!(barrier, |x, ()| {
                                 let (head, x) = x[i..].split_at_mut(1);
                                 (head[0], iter::split_mut(x, nthreads))
                             }) else {
@@ -963,7 +969,7 @@ mod tests {
                                 *x += head;
                             }
                         } else {
-                            let Some((head, mine)) = sync_await!(barrier, |x, ()| {
+                            let Ok((head, mine)) = sync_await!(barrier, |x, ()| {
                                 let (head, x) = x[i..].split_at_mut(1);
                                 (head[0], iter::split_mut(x, nthreads))
                             }) else {
