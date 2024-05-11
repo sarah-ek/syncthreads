@@ -1,5 +1,4 @@
 use core::cell::UnsafeCell;
-use core::fmt;
 use core::marker::PhantomData;
 use core::sync::atomic::AtomicUsize;
 use crossbeam::utils::CachePadded;
@@ -13,55 +12,8 @@ pub mod sync;
 mod dyn_vec;
 use dyn_vec::DynVec;
 
-#[derive(Copy, Clone)]
-struct Invariant<'brand> {
-    __invariant: PhantomData<fn(&'brand ()) -> &'brand ()>,
-}
-
-#[derive(Copy, Clone)]
-pub struct ThreadCount<'brand> {
-    inner: usize,
-    __marker: PhantomData<Invariant<'brand>>,
-}
-
-impl ThreadId<'_> {
-    #[inline]
-    pub fn inner(self) -> usize {
-        self.inner
-    }
-}
-
-impl ThreadCount<'_> {
-    #[inline]
-    pub fn inner(self) -> usize {
-        self.inner
-    }
-}
-
-#[derive(Copy, Clone)]
-pub struct ThreadId<'brand> {
-    inner: usize,
-    __no_sync_marker: PhantomData<(*mut (), Invariant<'brand>)>,
-}
-
-impl fmt::Debug for ThreadId<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ThreadId")
-            .field("inner", &self.inner)
-            .finish()
-    }
-}
-
-impl fmt::Debug for ThreadCount<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ThreadCount")
-            .field("inner", &self.inner)
-            .finish()
-    }
-}
-
 #[derive(Debug)]
-pub struct BarrierInit<'brand, T> {
+pub struct BarrierInit<T> {
     inner: sync::BarrierInit,
     data: UnsafeCell<T>,
     ctx: UnsafeCell<DynVec>,
@@ -69,21 +21,20 @@ pub struct BarrierInit<'brand, T> {
     exclusive: UnsafeCell<DynVec>,
     tid: AtomicUsize,
     tag: UnsafeCell<pretty::TypeId>,
-    __marker: PhantomData<Invariant<'brand>>,
 }
 #[derive(Debug)]
-pub struct Barrier<'brand, 'a, T, Ctx = ()> {
+pub struct Barrier<'a, T, Ctx = ()> {
     inner: sync::BarrierRef<'a>,
     data: &'a UnsafeCell<T>,
     ctx: &'a UnsafeCell<DynVec>,
     shared: &'a UnsafeCell<DynVec>,
     exclusive: &'a UnsafeCell<DynVec>,
-    tid: ThreadId<'brand>,
+    tid: usize,
     tag: &'a UnsafeCell<pretty::TypeId>,
     __marker: PhantomData<&'a UnsafeCell<Ctx>>,
 }
 #[derive(Debug)]
-pub struct AsyncBarrierInit<'brand, T> {
+pub struct AsyncBarrierInit<T> {
     inner: sync::AsyncBarrierInit,
     data: UnsafeCell<T>,
     ctx: UnsafeCell<DynVec>,
@@ -91,29 +42,28 @@ pub struct AsyncBarrierInit<'brand, T> {
     exclusive: UnsafeCell<DynVec>,
     tid: AtomicUsize,
     tag: UnsafeCell<pretty::TypeId>,
-    __marker: PhantomData<Invariant<'brand>>,
 }
 #[derive(Debug)]
-pub struct AsyncBarrier<'brand, 'a, T, Ctx = ()> {
+pub struct AsyncBarrier<'a, T, Ctx = ()> {
     inner: sync::AsyncBarrierRef<'a>,
     data: &'a UnsafeCell<T>,
     ctx: &'a UnsafeCell<DynVec>,
     shared: &'a UnsafeCell<DynVec>,
     exclusive: &'a UnsafeCell<DynVec>,
-    id: ThreadId<'brand>,
+    id: usize,
     tag: &'a UnsafeCell<pretty::TypeId>,
     __marker: PhantomData<&'a UnsafeCell<Ctx>>,
 }
 
-unsafe impl<T: Sync + Send> Sync for BarrierInit<'_, T> {}
-unsafe impl<T: Sync + Send> Send for BarrierInit<'_, T> {}
-unsafe impl<T: Sync + Send> Sync for Barrier<'_, '_, T> {}
-unsafe impl<T: Sync + Send> Send for Barrier<'_, '_, T> {}
+unsafe impl<T: Sync + Send> Sync for BarrierInit<T> {}
+unsafe impl<T: Sync + Send> Send for BarrierInit<T> {}
+unsafe impl<T: Sync + Send> Sync for Barrier<'_, T> {}
+unsafe impl<T: Sync + Send> Send for Barrier<'_, T> {}
 
-unsafe impl<T: Sync + Send> Sync for AsyncBarrierInit<'_, T> {}
-unsafe impl<T: Sync + Send> Send for AsyncBarrierInit<'_, T> {}
-unsafe impl<T: Sync + Send, Ctx: Sync + Send> Sync for AsyncBarrier<'_, '_, T, Ctx> {}
-unsafe impl<T: Sync + Send, Ctx: Sync + Send> Send for AsyncBarrier<'_, '_, T, Ctx> {}
+unsafe impl<T: Sync + Send> Sync for AsyncBarrierInit<T> {}
+unsafe impl<T: Sync + Send> Send for AsyncBarrierInit<T> {}
+unsafe impl<T: Sync + Send, Ctx: Sync + Send> Sync for AsyncBarrier<'_, T, Ctx> {}
+unsafe impl<T: Sync + Send, Ctx: Sync + Send> Send for AsyncBarrier<'_, T, Ctx> {}
 
 #[derive(Debug, Default)]
 pub struct AllocHint {
@@ -158,14 +108,8 @@ impl Default for Alloc {
     }
 }
 
-#[inline]
-pub fn with_barrier_init<T, R>(
-    value: T,
-    num_threads: usize,
-    hint: AllocHint,
-    f: impl for<'brand> FnOnce(BarrierInit<'brand, T>, ThreadCount) -> R,
-) -> R {
-    f(
+impl<T> BarrierInit<T> {
+    pub fn new(value: T, num_threads: usize, hint: AllocHint) -> Self {
         BarrierInit {
             inner: sync::BarrierInit::new(num_threads, Default::default()),
             data: UnsafeCell::new(value),
@@ -174,94 +118,110 @@ pub fn with_barrier_init<T, R>(
             exclusive: UnsafeCell::new(hint.exclusive.make_vec()),
             tid: AtomicUsize::new(0),
             tag: UnsafeCell::new(type_id_of_val(&())),
-            __marker: PhantomData,
-        },
-        ThreadCount {
-            inner: num_threads,
-            __marker: PhantomData,
-        },
-    )
-}
-
-#[inline]
-pub fn with_async_barrier_init<T, R>(
-    value: T,
-    num_threads: usize,
-    hint: AllocHint,
-    f: impl for<'brand> FnOnce(AsyncBarrierInit<'brand, T>) -> R,
-) -> R {
-    f(AsyncBarrierInit {
-        inner: sync::AsyncBarrierInit::new(num_threads, Default::default()),
-        data: UnsafeCell::new(value),
-        ctx: UnsafeCell::new({
-            let mut v = hint.ctx.make_vec();
-            v.collect(core::iter::once(UnsafeCell::new(())));
-            v
-        }),
-        shared: UnsafeCell::new(hint.shared.make_vec()),
-        exclusive: UnsafeCell::new(hint.exclusive.make_vec()),
-        tid: AtomicUsize::new(0),
-        tag: UnsafeCell::new(type_id_of_val(&())),
-        __marker: PhantomData,
-    })
-}
-
-impl<'brand, T> BarrierInit<'brand, T> {
-    pub fn into_inner(self) -> T {
-        self.data.into_inner()
+        }
     }
 
-    pub fn barrier_ref<'a>(&'a self) -> Barrier<'brand, 'a, T> {
+    pub fn into_inner(self) -> (T, AllocHint) {
+        (
+            self.data.into_inner(),
+            AllocHint {
+                shared: Alloc::Storage(Storage {
+                    alloc: self.shared.into_inner(),
+                }),
+                exclusive: Alloc::Storage(Storage {
+                    alloc: self.exclusive.into_inner(),
+                }),
+                ctx: Alloc::Storage(Storage {
+                    alloc: self.ctx.into_inner(),
+                }),
+            },
+        )
+    }
+
+    pub fn barrier_ref(&self) -> Barrier<'_, T> {
+        let tid = self.tid.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        assert!(tid < self.thread_count());
         Barrier {
             inner: self.inner.barrier_ref(),
             data: &self.data,
             ctx: &self.ctx,
             shared: &self.shared,
             exclusive: &self.exclusive,
-            tid: ThreadId {
-                inner: self.tid.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-                __no_sync_marker: PhantomData,
-            },
-            tag: &self.tag,
-            __marker: PhantomData,
-        }
-    }
-}
-
-impl<'brand, T> AsyncBarrierInit<'brand, T> {
-    pub fn into_inner(self) -> T {
-        self.data.into_inner()
-    }
-
-    pub fn barrier_ref(&self) -> AsyncBarrier<'brand, '_, T> {
-        AsyncBarrier {
-            inner: self.inner.barrier_ref(),
-            data: &self.data,
-            ctx: &self.ctx,
-            shared: &self.shared,
-            exclusive: &self.exclusive,
-            id: ThreadId {
-                inner: self.tid.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-                __no_sync_marker: PhantomData,
-            },
+            tid,
             tag: &self.tag,
             __marker: PhantomData,
         }
     }
 
     #[inline]
-    pub fn thread_count(&self) -> ThreadCount<'brand> {
-        ThreadCount {
-            inner: self.inner.num_threads(),
+    pub fn thread_count(&self) -> usize {
+        self.inner.num_threads()
+    }
+
+    pub fn reset(&mut self) {
+        *self.tid.get_mut() = 0;
+    }
+}
+
+impl<T> AsyncBarrierInit<T> {
+    pub fn new(value: T, num_threads: usize, hint: AllocHint) -> Self {
+        AsyncBarrierInit {
+            inner: sync::AsyncBarrierInit::new(num_threads, Default::default()),
+            data: UnsafeCell::new(value),
+            ctx: UnsafeCell::new({
+                let mut v = hint.ctx.make_vec();
+                v.collect(core::iter::once(UnsafeCell::new(())));
+                v
+            }),
+            shared: UnsafeCell::new(hint.shared.make_vec()),
+            exclusive: UnsafeCell::new(hint.exclusive.make_vec()),
+            tid: AtomicUsize::new(0),
+            tag: UnsafeCell::new(type_id_of_val(&())),
+        }
+    }
+
+    pub fn into_inner(self) -> (T, AllocHint) {
+        (
+            self.data.into_inner(),
+            AllocHint {
+                shared: Alloc::Storage(Storage {
+                    alloc: self.shared.into_inner(),
+                }),
+                exclusive: Alloc::Storage(Storage {
+                    alloc: self.exclusive.into_inner(),
+                }),
+                ctx: Alloc::Storage(Storage {
+                    alloc: self.ctx.into_inner(),
+                }),
+            },
+        )
+    }
+
+    pub fn barrier_ref(&self) -> AsyncBarrier<'_, T> {
+        let tid = self.tid.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        assert!(tid < self.thread_count());
+        AsyncBarrier {
+            inner: self.inner.barrier_ref(),
+            data: &self.data,
+            ctx: &self.ctx,
+            shared: &self.shared,
+            exclusive: &self.exclusive,
+            id: tid,
+            tag: &self.tag,
             __marker: PhantomData,
         }
+    }
+
+    #[inline]
+    pub fn thread_count(&self) -> usize {
+        self.inner.num_threads()
     }
 
     pub fn reset(&mut self) {
         *self.tid.get_mut() = 0;
     }
 
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> AsyncBarrierInit<'brand, U> {
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> AsyncBarrierInit<U> {
         let mut this = self;
         this.reset();
         AsyncBarrierInit {
@@ -272,13 +232,17 @@ impl<'brand, T> AsyncBarrierInit<'brand, T> {
             exclusive: this.exclusive,
             tid: this.tid,
             tag: this.tag,
-            __marker: PhantomData,
         }
     }
 }
 
-impl<'brand, 'a, T, Ctx> Barrier<'brand, 'a, T, Ctx> {
-    pub unsafe fn sync<'b, Shared: Sync, Exclusive: Send, I: IntoIterator<Item = Exclusive>>(
+impl<'a, T, Ctx> Barrier<'a, T, Ctx> {
+    pub unsafe fn sync_blocking<
+        'b,
+        Shared: Sync,
+        Exclusive: Send,
+        I: IntoIterator<Item = Exclusive>,
+    >(
         &'b mut self,
         f: impl FnOnce(&'a mut T) -> (Shared, I),
         tag: impl core::any::Any,
@@ -307,17 +271,17 @@ impl<'brand, 'a, T, Ctx> Barrier<'brand, 'a, T, Ctx> {
             unsafe { &(&*self.shared.get()).assume_ref::<Shared>()[0] },
             unsafe {
                 &mut *((&*self.exclusive.get()).assume_ref::<CachePadded<UnsafeCell<Exclusive>>>()
-                    [self.tid.inner]
+                    [self.tid]
                     .get())
             },
         ))
     }
 
-    pub unsafe fn map_mut<'b, NewCtx: 'a>(
+    pub unsafe fn map_mut_blocking<'b, NewCtx: 'a>(
         &'b mut self,
         f: impl FnOnce(Ctx) -> NewCtx,
         tag: impl core::any::Any,
-    ) -> Option<AsyncBarrier<'b, 'a, T, NewCtx>> {
+    ) -> Option<Barrier<'b, T, NewCtx>> {
         let tag = type_id_of_val(&tag);
         match self.inner.wait() {
             sync::BarrierWaitResult::Leader => {
@@ -341,22 +305,20 @@ impl<'brand, 'a, T, Ctx> Barrier<'brand, 'a, T, Ctx> {
         let self_tag = unsafe { *self.tag.get() };
         equator::assert!(tag == self_tag);
 
-        Some(unsafe {
-            core::mem::transmute(Barrier::<'brand, 'b, T, NewCtx> {
-                inner: self.inner.rb_mut(),
-                data: self.data,
-                ctx: self.ctx,
-                shared: self.shared,
-                exclusive: self.exclusive,
-                tid: self.tid,
-                tag: self.tag,
-                __marker: PhantomData,
-            })
+        Some(Barrier::<'b, T, NewCtx> {
+            inner: self.inner.rb_mut(),
+            data: self.data,
+            ctx: self.ctx,
+            shared: self.shared,
+            exclusive: self.exclusive,
+            tid: self.tid,
+            tag: self.tag,
+            __marker: PhantomData,
         })
     }
 
     #[inline]
-    pub fn id(&self) -> ThreadId<'brand> {
+    pub fn id(&self) -> usize {
         self.tid
     }
 }
@@ -364,21 +326,30 @@ impl<'brand, 'a, T, Ctx> Barrier<'brand, 'a, T, Ctx> {
 fn type_id_of_val<T: 'static>(_: &T) -> pretty::TypeId {
     pretty::TypeId {
         id: core::any::TypeId::of::<T>(),
-        name: core::any::type_name::<T>(),
+        name: pretty::Str(core::any::type_name::<T>()),
     }
 }
 
 #[macro_export]
-macro_rules! sync {
+macro_rules! sync_await {
     ($bar: expr, $f:expr) => {{
         #[allow(unused_unsafe)]
-        let x = unsafe { ($bar).sync($f, || {}) };
+        let x = unsafe { ($bar).sync($f, || {}).await };
         x
     }};
 }
 
 #[macro_export]
-macro_rules! map_mut {
+macro_rules! sync_blocking {
+    ($bar: expr, $f:expr) => {{
+        #[allow(unused_unsafe)]
+        let x = unsafe { ($bar).sync_blocking($f, || {}) };
+        x
+    }};
+}
+
+#[macro_export]
+macro_rules! map_mut_await {
     ($bar: expr, $f:expr) => {{
         #[allow(unused_unsafe)]
         let x = unsafe { ($bar).map_mut($f, || {}).await };
@@ -386,12 +357,32 @@ macro_rules! map_mut {
     }};
 }
 
+#[macro_export]
+macro_rules! map_mut_blocking {
+    ($bar: expr, $f:expr) => {{
+        #[allow(unused_unsafe)]
+        let x = unsafe { ($bar).map_mut_blocking($f, || {}) };
+        x
+    }};
+}
+
 mod pretty {
+    use core::fmt;
+
+    #[derive(Copy, Clone)]
+    pub struct Str(pub &'static str);
+
+    impl fmt::Debug for Str {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
     #[derive(Copy, Clone, Debug)]
     pub struct TypeId {
-        pub id: core::any::TypeId,
         #[allow(dead_code)]
-        pub name: &'static str,
+        pub name: Str,
+        pub id: core::any::TypeId,
     }
 
     impl PartialEq for TypeId {
@@ -402,7 +393,7 @@ mod pretty {
     }
 }
 
-impl<'brand, 'a, T, Ctx> AsyncBarrier<'brand, 'a, T, Ctx> {
+impl<'a, T, Ctx> AsyncBarrier<'a, T, Ctx> {
     pub async unsafe fn sync<
         'b,
         Shared: 'b + Sync,
@@ -440,7 +431,7 @@ impl<'brand, 'a, T, Ctx> AsyncBarrier<'brand, 'a, T, Ctx> {
         let shared = &unsafe { (&*self.shared.get()).assume_ref::<Shared>() }[0];
         Some((shared, unsafe {
             &mut *((&*self.exclusive.get()).assume_ref::<CachePadded<UnsafeCell<Exclusive>>>()
-                [self.id.inner]
+                [self.id]
                 .get())
         }))
     }
@@ -449,7 +440,7 @@ impl<'brand, 'a, T, Ctx> AsyncBarrier<'brand, 'a, T, Ctx> {
         &'b mut self,
         f: impl FnOnce(Ctx) -> NewCtx,
         tag: impl core::any::Any,
-    ) -> Option<AsyncBarrier<'b, 'a, T, NewCtx>> {
+    ) -> Option<AsyncBarrier<'b, T, NewCtx>> {
         let tag = type_id_of_val(&tag);
         match self.inner.wait().await {
             sync::AsyncBarrierWaitResult::Leader => {
@@ -473,31 +464,26 @@ impl<'brand, 'a, T, Ctx> AsyncBarrier<'brand, 'a, T, Ctx> {
         let self_tag = unsafe { *self.tag.get() };
         equator::assert!(tag == self_tag);
 
-        Some(unsafe {
-            core::mem::transmute(AsyncBarrier::<'brand, 'b, T, NewCtx> {
-                inner: self.inner.rb_mut(),
-                data: self.data,
-                ctx: self.ctx,
-                shared: self.shared,
-                exclusive: self.exclusive,
-                id: self.id,
-                tag: self.tag,
-                __marker: PhantomData,
-            })
+        Some(AsyncBarrier::<'b, T, NewCtx> {
+            inner: self.inner.rb_mut(),
+            data: self.data,
+            ctx: self.ctx,
+            shared: self.shared,
+            exclusive: self.exclusive,
+            id: self.id,
+            tag: self.tag,
+            __marker: PhantomData,
         })
     }
 
     #[inline]
-    pub fn id(&self) -> ThreadId<'brand> {
+    pub fn id(&self) -> usize {
         self.id
     }
 
     #[inline]
-    pub fn thread_count(&self) -> ThreadCount<'brand> {
-        ThreadCount {
-            inner: self.inner.num_threads(),
-            __marker: PhantomData,
-        }
+    pub fn thread_count(&self) -> usize {
+        self.inner.num_threads()
     }
 }
 
@@ -524,32 +510,30 @@ mod tests {
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
-                with_barrier_init(&mut *x, nthreads, default(), |init, _| {
-                    let init = &init;
-                    std::thread::scope(|s| {
-                        for _ in 0..nthreads {
-                            s.spawn(move || {
-                                let mut barrier = init.barrier_ref();
+                let init = BarrierInit::new(&mut *x, nthreads, default());
+                std::thread::scope(|s| {
+                    for _ in 0..nthreads {
+                        s.spawn(|| {
+                            let mut barrier = init.barrier_ref();
 
-                                for i in 0..n / 2 {
-                                    let Some((head, data)) = sync!(barrier, |x| {
-                                        let (head, x) = x[i..].split_at_mut(1);
+                            for i in 0..n / 2 {
+                                let Some((head, data)) = sync_blocking!(barrier, |x| {
+                                    let (head, x) = x[i..].split_at_mut(1);
 
-                                        (head[0], iter::split_mut(x, nthreads))
-                                    }) else {
-                                        break;
-                                    };
+                                    (head[0], iter::split_mut(x, nthreads))
+                                }) else {
+                                    break;
+                                };
 
-                                    let head = *head;
-                                    let mine = &mut **data;
+                                let head = *head;
+                                let mine = &mut **data;
 
-                                    for x in mine.iter_mut() {
-                                        *x += head;
-                                    }
+                                for x in mine.iter_mut() {
+                                    *x += head;
                                 }
-                            });
-                        }
-                    });
+                            }
+                        });
+                    }
                 });
             }
             dbg!(now.elapsed());
@@ -574,28 +558,26 @@ mod tests {
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
                 let nthreads = rayon::current_num_threads();
-                with_barrier_init(&mut *x, nthreads, default(), |init, nthreads| {
-                    let init = &init;
-                    threadpool_scope::scope_with(&pool, |scope| {
-                        for _ in 0..nthreads.inner() {
-                            scope.execute(move || {
-                                let mut barrier = init.barrier_ref();
+                let init = BarrierInit::new(&mut *x, nthreads, default());
+                threadpool_scope::scope_with(&pool, |scope| {
+                    for _ in 0..nthreads {
+                        scope.execute(|| {
+                            let mut barrier = init.barrier_ref();
 
-                                for i in 0..n / 2 {
-                                    let Some((&head, mine)) = sync!(barrier, |x| {
-                                        let (head, x) = x[i..].split_at_mut(1);
-                                        (head[0], iter::split_mut(x, nthreads.inner()))
-                                    }) else {
-                                        break;
-                                    };
-                                    let mine = &mut **mine;
-                                    for x in mine.iter_mut() {
-                                        *x += head;
-                                    }
+                            for i in 0..n / 2 {
+                                let Some((&head, mine)) = sync_blocking!(barrier, |x| {
+                                    let (head, x) = x[i..].split_at_mut(1);
+                                    (head[0], iter::split_mut(x, nthreads))
+                                }) else {
+                                    break;
+                                };
+                                let mine = &mut **mine;
+                                for x in mine.iter_mut() {
+                                    *x += head;
                                 }
-                            });
-                        }
-                    });
+                            }
+                        });
+                    }
                 });
             }
             dbg!(now.elapsed());
@@ -673,32 +655,29 @@ mod tests {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
-                with_barrier_init(&mut *x, nthreads, default(), |init, nthreads| {
-                    let init = &init;
+                let init = BarrierInit::new(&mut *x, nthreads, default());
+                pool.in_place_scope(|s| {
+                    for _ in 0..nthreads {
+                        s.spawn(|_| {
+                            let mut barrier = init.barrier_ref();
 
-                    pool.in_place_scope(|s| {
-                        for _ in 0..nthreads.inner() {
-                            s.spawn(move |_| {
-                                let mut barrier = init.barrier_ref();
+                            for i in 0..n / 2 {
+                                let Some((head, mine)) = sync_blocking!(barrier, |x| {
+                                    let (head, x) = x[i..].split_at_mut(1);
+                                    (head[0], iter::split_mut(x, nthreads))
+                                }) else {
+                                    break;
+                                };
 
-                                for i in 0..n / 2 {
-                                    let Some((head, mine)) = sync!(barrier, |x| {
-                                        let (head, x) = x[i..].split_at_mut(1);
-                                        (head[0], iter::split_mut(x, nthreads.inner()))
-                                    }) else {
-                                        break;
-                                    };
+                                let head = *head;
+                                let mine = &mut **mine;
 
-                                    let head = *head;
-                                    let mine = &mut **mine;
-
-                                    for x in mine.iter_mut() {
-                                        *x += head;
-                                    }
+                                for x in mine.iter_mut() {
+                                    *x += head;
                                 }
-                            });
-                        }
-                    });
+                            }
+                        });
+                    }
                 });
             }
             dbg!(now.elapsed());
@@ -768,7 +747,7 @@ mod tests {
     }
 
     fn with_runtime(runtime: &tokio::runtime::Runtime) {
-        let nthreads = rayon::current_num_threads();
+        let nthreads = 3;
 
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
@@ -776,32 +755,29 @@ mod tests {
                 let n = N;
                 let x = &mut *vec![1.0; n];
 
-                with_async_barrier_init(&mut *x, nthreads, AllocHint::default(), |init| {
-                    tokio_scoped::scoped(runtime.handle()).scope(|scope| {
-                        for _ in 0..nthreads {
-                            scope.spawn(async {
-                                let mut barrier = init.barrier_ref();
+                let init = AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default());
+                tokio_scoped::scoped(runtime.handle()).scope(|scope| {
+                    for _ in 0..nthreads {
+                        scope.spawn(async {
+                            let mut barrier = init.barrier_ref();
 
-                                for i in 0..n / 2 {
-                                    let Some((head, mine)) = sync!(barrier, |x, ()| {
-                                        let (head, x) = x[i..].split_at_mut(1);
-                                        (head[0], iter::split_mut(x, nthreads))
-                                    })
-                                    .await
-                                    else {
-                                        break;
-                                    };
+                            for i in 0..n / 2 {
+                                let Some((head, mine)) = sync_await!(barrier, |x, ()| {
+                                    let (head, x) = x[i..].split_at_mut(1);
+                                    (head[0], iter::split_mut(x, nthreads))
+                                }) else {
+                                    break;
+                                };
 
-                                    let head = *head;
-                                    let mine = &mut **mine;
+                                let head = *head;
+                                let mine = &mut **mine;
 
-                                    for x in mine.iter_mut() {
-                                        *x += head;
-                                    }
+                                for x in mine.iter_mut() {
+                                    *x += head;
                                 }
-                            });
-                        }
-                    });
+                            }
+                        });
+                    }
                 });
             }
             dbg!(now.elapsed());
@@ -818,17 +794,66 @@ mod tests {
                 let n = N;
                 let x = &mut *vec![1.0; n];
 
-                with_async_barrier_init(&mut *x, nthreads, AllocHint::default(), |init| {
-                    pollster::block_on(join_all((0..nthreads).map(|_| async {
-                        let mut barrier = init.barrier_ref();
+                let init = AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default());
+                pollster::block_on(join_all((0..nthreads).map(|_| async {
+                    let mut barrier = init.barrier_ref();
 
-                        for i in 0..n / 2 {
-                            let Some((head, mine)) = sync!(barrier, |x, ()| {
+                    for i in 0..n / 2 {
+                        let Some((head, mine)) = sync_await!(barrier, |x, ()| {
+                            let (head, x) = x[i..].split_at_mut(1);
+                            (head[0], iter::split_mut(x, nthreads))
+                        }) else {
+                            break;
+                        };
+
+                        let head = *head;
+                        let mine = &mut **mine;
+
+                        for x in mine.iter_mut() {
+                            *x += head;
+                        }
+                    }
+                })));
+            }
+            dbg!(now.elapsed());
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_branchy() {
+        let nthreads = rayon::current_num_threads();
+
+        for _ in 0..SAMPLES {
+            let now = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let n = N;
+                let x = &mut *vec![1.0; n];
+
+                let init = AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default());
+                pollster::block_on(join_all((0..nthreads).map(|_| async {
+                    let mut barrier = init.barrier_ref();
+
+                    for i in 0..n / 2 {
+                        if barrier.id() == 0 {
+                            let Some((head, mine)) = sync_await!(barrier, |x, ()| {
                                 let (head, x) = x[i..].split_at_mut(1);
                                 (head[0], iter::split_mut(x, nthreads))
-                            })
-                            .await
-                            else {
+                            }) else {
+                                break;
+                            };
+
+                            let head = *head;
+                            let mine = &mut **mine;
+
+                            for x in mine.iter_mut() {
+                                *x += head;
+                            }
+                        } else {
+                            let Some((head, mine)) = sync_await!(barrier, |x, ()| {
+                                let (head, x) = x[i..].split_at_mut(1);
+                                (head[0], iter::split_mut(x, nthreads))
+                            }) else {
                                 break;
                             };
 
@@ -839,8 +864,8 @@ mod tests {
                                 *x += head;
                             }
                         }
-                    })));
-                });
+                    }
+                })));
             }
             dbg!(now.elapsed());
         }

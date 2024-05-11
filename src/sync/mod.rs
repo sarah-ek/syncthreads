@@ -1,10 +1,11 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use crossbeam::queue::SegQueue;
 use reborrow::*;
 use std::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -18,6 +19,10 @@ impl Default for BarrierParams {
         }
     }
 }
+
+const SHIFT: u32 = usize::BITS - 1;
+const HIGH_BIT: usize = 1 << SHIFT;
+const LOW_MASK: usize = !HIGH_BIT;
 
 pub const DEFAULT_SPIN_ITERS_BEFORE_PARK: usize = 1 << 14;
 
@@ -73,20 +78,15 @@ pub enum AdaBarrierWaitResult {
     Dropped,
 }
 
-static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(0);
-thread_local! {
-  static GLOBAL_TID: usize = GLOBAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
 #[derive(Debug)]
 pub struct AsyncBarrierInit {
     done: AtomicBool,
-    waiting_for_leader: AtomicBool,
-    gsense: AtomicBool,
+    waiting_for_leader: AtomicUsize,
+    gsense: AtomicUsize,
     count: AtomicUsize,
+    wait_wakers: [SegQueue<Waker>; 2],
+    follow_wakers: [SegQueue<Waker>; 2],
     max: usize,
-    tids: Vec<AtomicUsize>,
-    blocking: AtomicBool,
     params: BarrierParams,
 }
 #[derive(Debug)]
@@ -112,6 +112,11 @@ impl BarrierInit {
             max: num_threads,
             params,
         }
+    }
+
+    #[inline]
+    pub fn num_threads(&self) -> usize {
+        self.max
     }
 
     pub fn barrier(self: Arc<Self>) -> Barrier {
@@ -142,7 +147,7 @@ impl AdaBarrierInit {
         if self.started.fetch_or(true, SeqCst) {
             let mut count_gsense = self.count_gsense.load(SeqCst);
             loop {
-                if count_gsense & !(1usize << (usize::BITS - 1)) == 0 {
+                if count_gsense & LOW_MASK == 0 {
                     count_gsense = self.count_gsense.load(SeqCst);
                     continue;
                 }
@@ -159,12 +164,12 @@ impl AdaBarrierInit {
                 }
             }
             self.max.fetch_add(1, SeqCst);
-            let lsense = (count_gsense >> (usize::BITS - 1)) != 0;
+            let lsense = count_gsense >> SHIFT != 0;
             AdaBarrier { init: self, lsense }
         } else {
             let count_gsense = self.count_gsense.fetch_add(1, SeqCst);
             self.max.fetch_add(1, SeqCst);
-            let lsense = (count_gsense >> (usize::BITS - 1)) != 0;
+            let lsense = count_gsense >> SHIFT != 0;
             AdaBarrier { init: self, lsense }
         }
     }
@@ -173,7 +178,7 @@ impl AdaBarrierInit {
         if self.started.fetch_or(true, SeqCst) {
             let mut count_gsense = self.count_gsense.load(SeqCst);
             loop {
-                if count_gsense & !(1usize << (usize::BITS - 1)) == 0 {
+                if count_gsense & LOW_MASK == 0 {
                     count_gsense = self.count_gsense.load(SeqCst);
                     continue;
                 }
@@ -190,12 +195,12 @@ impl AdaBarrierInit {
                 }
             }
             self.max.fetch_add(1, SeqCst);
-            let lsense = (count_gsense >> (usize::BITS - 1)) != 0;
+            let lsense = count_gsense >> SHIFT != 0;
             AdaBarrierRef { init: self, lsense }
         } else {
             let count_gsense = self.count_gsense.fetch_add(1, SeqCst);
             self.max.fetch_add(1, SeqCst);
-            let lsense = (count_gsense >> (usize::BITS - 1)) != 0;
+            let lsense = count_gsense >> SHIFT != 0;
             AdaBarrierRef { init: self, lsense }
         }
     }
@@ -206,12 +211,12 @@ impl AsyncBarrierInit {
     pub fn new(num_threads: usize, params: BarrierParams) -> Self {
         Self {
             done: AtomicBool::new(false),
-            waiting_for_leader: AtomicBool::new(false),
+            waiting_for_leader: AtomicUsize::new(0),
             count: AtomicUsize::new(num_threads),
-            gsense: AtomicBool::new(false),
+            gsense: AtomicUsize::new(0),
+            wait_wakers: [SegQueue::new(), SegQueue::new()],
+            follow_wakers: [SegQueue::new(), SegQueue::new()],
             max: num_threads,
-            tids: (0..num_threads).map(|_| AtomicUsize::new(0)).collect(),
-            blocking: AtomicBool::new(false),
             params,
         }
     }
@@ -222,7 +227,7 @@ impl AsyncBarrierInit {
     }
 
     pub fn barrier_ref(&self) -> AsyncBarrierRef<'_> {
-        let lsense = self.gsense.load(SeqCst);
+        let lsense = self.gsense.load(SeqCst) >> SHIFT == 1;
         AsyncBarrierRef { init: self, lsense }
     }
 }
@@ -320,13 +325,12 @@ macro_rules! impl_ada_barrier {
                 let addr =
                     unsafe { core::mem::transmute::<_, usize>(addr as *const AdaBarrierInit) };
 
-                if self.init.count_gsense.fetch_sub(1, SeqCst) & !(1usize << (usize::BITS - 1)) == 1
-                {
+                if self.init.count_gsense.fetch_sub(1, SeqCst) & LOW_MASK == 1 {
                     let max = self.init.max.load(SeqCst);
                     self.init.waiting_for_leader.store(true, SeqCst);
                     self.init
                         .count_gsense
-                        .store(max | ((self.lsense as usize) << (usize::BITS - 1)), SeqCst);
+                        .store(max | ((self.lsense as usize) << SHIFT), SeqCst);
                     unsafe {
                         parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN)
                     };
@@ -334,9 +338,7 @@ macro_rules! impl_ada_barrier {
                 } else {
                     let mut wait = parking_lot_core::SpinWait::new();
                     let mut iters = 0usize;
-                    while (self.init.count_gsense.load(SeqCst) >> (usize::BITS - 1) != 0)
-                        != self.lsense
-                    {
+                    while self.init.count_gsense.load(SeqCst) >> SHIFT != self.lsense as usize {
                         if self.init.done.load(SeqCst) {
                             return AdaBarrierWaitResult::Dropped;
                         };
@@ -347,9 +349,8 @@ macro_rules! impl_ada_barrier {
                                 parking_lot_core::park(
                                     addr,
                                     || {
-                                        (self.init.count_gsense.load(SeqCst) >> (usize::BITS - 1)
-                                            != 0)
-                                            != self.lsense
+                                        self.init.count_gsense.load(SeqCst) >> SHIFT
+                                            != self.lsense as usize
                                     },
                                     || {},
                                     |_, _| {},
@@ -420,166 +421,163 @@ impl AsyncBarrierRef<'_> {
     pub async fn wait(&mut self) -> AsyncBarrierWaitResult {
         self.lsense = !self.lsense;
         let lsense = self.lsense;
-        let addr: &AsyncBarrierInit = &*self.init;
-        let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const AsyncBarrierInit) };
+        let wakers = &self.init.wait_wakers[lsense as usize];
 
         let count = self.init.count.fetch_sub(1, SeqCst) - 1;
-        let blocking = self.init.blocking.load(SeqCst);
-        if !blocking {
-            self.init.tids[count].store(GLOBAL_TID.with(|x| *x), SeqCst);
-        }
         if count == 0 {
-            if !blocking {
-                let tids = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        self.init.tids.as_ptr() as *mut usize,
-                        self.init.tids.len(),
-                    )
-                };
-                tids.sort_unstable();
-                let mut dup = false;
-                for tid in tids.windows(2) {
-                    if tid[0] == tid[1] {
-                        dup = true;
-                    }
-                }
-                if !dup {
-                    self.init.blocking.store(true, SeqCst);
+            let max = self.init.max;
+            self.init.waiting_for_leader.store(HIGH_BIT, SeqCst);
+            self.init.count.store(max, SeqCst);
+            let mut wakers_count = self.init.gsense.fetch_xor(HIGH_BIT, SeqCst) & LOW_MASK;
+            while wakers_count > 0 {
+                if let Some(waker) = wakers.pop() {
+                    waker.wake();
+                    wakers_count -= 1;
+                    self.init.gsense.fetch_sub(1, SeqCst);
                 }
             }
 
-            let max = self.init.max;
-            self.init.waiting_for_leader.store(true, SeqCst);
-            self.init.count.store(max, SeqCst);
-            self.init.gsense.store(lsense, SeqCst);
-            if blocking {
-                unsafe {
-                    parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN)
-                };
-            }
             AsyncBarrierWaitResult::Leader
         } else {
             struct Wait<'a> {
-                gsense: &'a AtomicBool,
+                gsense: &'a AtomicUsize,
                 done: &'a AtomicBool,
                 lsense: bool,
+                wakers: &'a SegQueue<Waker>,
+                iters: usize,
+                params: &'a BarrierParams,
             }
 
             impl Future for Wait<'_> {
                 type Output = bool;
 
-                fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                    if self.gsense.load(SeqCst) != self.lsense {
-                        if self.done.load(SeqCst) {
-                            Poll::Ready(true)
+                fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                    let lsense = self.lsense as usize;
+                    let mut gsense = self.gsense.load(SeqCst);
+                    let iter = self.iters;
+                    self.iters += 1;
+
+                    if iter < self.params.spin_iters_before_park {
+                        if gsense >> SHIFT != lsense {
+                            if self.done.load(SeqCst) {
+                                Poll::Ready(true)
+                            } else {
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
                         } else {
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
+                            Poll::Ready(false)
                         }
                     } else {
-                        Poll::Ready(false)
+                        loop {
+                            if gsense >> SHIFT == lsense {
+                                return Poll::Ready(false);
+                            }
+                            if self.done.load(SeqCst) {
+                                return Poll::Ready(true);
+                            }
+
+                            match self.gsense.compare_exchange_weak(
+                                gsense,
+                                gsense + 1,
+                                SeqCst,
+                                SeqCst,
+                            ) {
+                                Ok(_) => {
+                                    self.wakers.push(cx.waker().clone());
+                                    return Poll::Pending;
+                                }
+                                Err(new) => gsense = new,
+                            }
+                        }
                     }
                 }
             }
 
-            if blocking {
-                let mut wait = parking_lot_core::SpinWait::new();
-                let mut iters = 0usize;
-                while self.init.gsense.load(SeqCst) != self.lsense {
-                    if self.init.done.load(SeqCst) {
-                        return AsyncBarrierWaitResult::Dropped;
-                    }
-                    wait.spin();
-                    if iters >= self.init.params.spin_iters_before_park {
-                        unsafe {
-                            parking_lot_core::park(
-                                addr,
-                                || self.init.gsense.load(SeqCst) != self.lsense,
-                                || {},
-                                |_, _| {},
-                                parking_lot_core::DEFAULT_PARK_TOKEN,
-                                None,
-                            );
-                        }
-                    };
-                    iters += 1;
-                }
-                AsyncBarrierWaitResult::Follower
+            if (Wait {
+                gsense: &self.init.gsense,
+                done: &self.init.done,
+                lsense,
+                wakers,
+                iters: 0,
+                params: &self.init.params,
+            }
+            .await)
+            {
+                AsyncBarrierWaitResult::Dropped
             } else {
-                if (Wait {
-                    gsense: &self.init.gsense,
-                    done: &self.init.done,
-                    lsense,
-                }
-                .await)
-                {
-                    AsyncBarrierWaitResult::Dropped
-                } else {
-                    AsyncBarrierWaitResult::Follower
-                }
+                AsyncBarrierWaitResult::Follower
             }
         }
     }
 
     pub fn lead(&self) {
-        self.init.waiting_for_leader.store(false, SeqCst);
-
-        let blocking = self.init.blocking.load(SeqCst);
-        if blocking {
-            let addr: &AsyncBarrierInit = &*self.init;
-            let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const AsyncBarrierInit) };
-            unsafe { parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN) };
+        let lsense = self.lsense;
+        let wakers = &self.init.follow_wakers[lsense as usize];
+        let mut wakers_count = self.init.waiting_for_leader.fetch_and(LOW_MASK, SeqCst) & LOW_MASK;
+        while wakers_count > 0 {
+            if let Some(waker) = wakers.pop() {
+                waker.wake();
+                wakers_count -= 1;
+            }
         }
     }
 
     #[inline(never)]
     pub async fn follow(&self) {
         struct Wait<'a> {
-            waiting_for_leader: &'a AtomicBool,
+            waiting_for_leader: &'a AtomicUsize,
+            wakers: &'a SegQueue<Waker>,
+            iters: usize,
+            params: &'a BarrierParams,
         }
 
         impl Future for Wait<'_> {
             type Output = ();
 
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                if self.waiting_for_leader.load(SeqCst) {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let iter = self.iters;
+                self.iters += 1;
+                let mut waiting_for_leader = self.waiting_for_leader.load(SeqCst);
+                if iter < self.params.spin_iters_before_park {
+                    if waiting_for_leader >> SHIFT == 1 {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
                 } else {
-                    Poll::Ready(())
+                    loop {
+                        if waiting_for_leader >> SHIFT == 0 {
+                            return Poll::Ready(());
+                        }
+
+                        match self.waiting_for_leader.compare_exchange_weak(
+                            waiting_for_leader,
+                            waiting_for_leader + 1,
+                            SeqCst,
+                            SeqCst,
+                        ) {
+                            Ok(_) => {
+                                self.wakers.push(cx.waker().clone());
+                                return Poll::Pending;
+                            }
+                            Err(new) => waiting_for_leader = new,
+                        }
+                    }
                 }
             }
         }
 
-        let blocking = self.init.blocking.load(SeqCst);
-        if blocking {
-            let addr: &AsyncBarrierInit = &*self.init;
-            let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const AsyncBarrierInit) };
-
-            let mut wait = parking_lot_core::SpinWait::new();
-            let mut iters = 0usize;
-            while self.init.waiting_for_leader.load(SeqCst) {
-                wait.spin();
-                if iters >= self.init.params.spin_iters_before_park {
-                    unsafe {
-                        parking_lot_core::park(
-                            addr,
-                            || self.init.waiting_for_leader.load(SeqCst),
-                            || {},
-                            |_, _| {},
-                            parking_lot_core::DEFAULT_PARK_TOKEN,
-                            None,
-                        )
-                    };
-                }
-                iters += 1;
-            }
-        } else {
-            Wait {
-                waiting_for_leader: &self.init.waiting_for_leader,
-            }
-            .await;
+        let lsense = self.lsense;
+        let wakers = &self.init.follow_wakers[lsense as usize];
+        Wait {
+            waiting_for_leader: &self.init.waiting_for_leader,
+            iters: 0,
+            wakers,
+            params: &self.init.params,
         }
+        .await;
     }
 }
 

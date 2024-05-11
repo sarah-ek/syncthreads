@@ -2,7 +2,7 @@ use core_affinity::CoreId;
 use diol::prelude::*;
 use rayon::prelude::*;
 use std::sync::atomic::AtomicUsize;
-use syncthreads::{with_async_barrier_init, with_barrier_init, AllocHint};
+use syncthreads::{AllocHint, AsyncBarrierInit, BarrierInit};
 
 fn sequential(bencher: Bencher, PlotArg(n): PlotArg) {
     let x = &mut *vec![1.0; n];
@@ -63,32 +63,30 @@ fn barrier(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        with_barrier_init(&mut *x, nthreads, AllocHint::default(), |init, nthreads| {
-            let init = &init;
+        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default());
 
-            rayon::in_place_scope(|s| {
-                for _ in 0..nthreads.inner() {
-                    s.spawn(move |_| {
-                        let mut barrier = init.barrier_ref();
+        rayon::in_place_scope(|s| {
+            for _ in 0..nthreads {
+                s.spawn(|_| {
+                    let mut barrier = init.barrier_ref();
 
-                        for i in 0..n / 2 {
-                            let Some((head, mine)) = syncthreads::sync!(barrier, |x| {
-                                let (head, x) = x[i..].split_at_mut(1);
-                                (head[0], syncthreads::iter::split_mut(x, nthreads.inner()))
-                            }) else {
-                                break;
-                            };
+                    for i in 0..n / 2 {
+                        let Some((head, mine)) = syncthreads::sync_blocking!(barrier, |x| {
+                            let (head, x) = x[i..].split_at_mut(1);
+                            (head[0], syncthreads::iter::split_mut(x, nthreads))
+                        }) else {
+                            break;
+                        };
 
-                            let head = *head;
-                            let mine = &mut **mine;
+                        let head = *head;
+                        let mine = &mut **mine;
 
-                            for x in mine.iter_mut() {
-                                *x += head;
-                            }
+                        for x in mine.iter_mut() {
+                            *x += head;
                         }
-                    });
-                }
-            });
+                    }
+                });
+            }
         });
     })
 }
@@ -111,32 +109,29 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
     let x = &mut *vec![1.0; n];
 
     bencher.bench(|| {
-        with_async_barrier_init(&mut *x, nthreads, AllocHint::default(), |init| {
-            tokio_scoped::scoped(runtime.handle()).scope(|scope| {
-                for _ in 0..nthreads {
-                    scope.spawn(async {
-                        let mut barrier = init.barrier_ref();
+        let init = AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default());
+        tokio_scoped::scoped(runtime.handle()).scope(|scope| {
+            for _ in 0..nthreads {
+                scope.spawn(async {
+                    let mut barrier = init.barrier_ref();
 
-                        for i in 0..n / 2 {
-                            let Some((head, mine)) = syncthreads::sync!(barrier, |x, ()| {
-                                let (head, x) = x[i..].split_at_mut(1);
-                                (head[0], syncthreads::iter::split_mut(x, nthreads))
-                            })
-                            .await
-                            else {
-                                break;
-                            };
+                    for i in 0..n / 2 {
+                        let Some((head, mine)) = syncthreads::sync_await!(barrier, |x, ()| {
+                            let (head, x) = x[i..].split_at_mut(1);
+                            (head[0], syncthreads::iter::split_mut(x, nthreads))
+                        }) else {
+                            break;
+                        };
 
-                            let head = *head;
-                            let mine = &mut **mine;
+                        let head = *head;
+                        let mine = &mut **mine;
 
-                            for x in mine.iter_mut() {
-                                *x += head;
-                            }
+                        for x in mine.iter_mut() {
+                            *x += head;
                         }
-                    });
-                }
-            });
+                    }
+                });
+            }
         });
     })
 }
