@@ -243,6 +243,11 @@ impl AsyncBarrierInit {
 macro_rules! impl_barrier {
     ($bar: ty) => {
         impl $bar {
+            #[inline]
+            pub fn num_threads(&self) -> usize {
+                self.init.max
+            }
+
             #[inline(never)]
             pub fn wait(&mut self) -> BarrierWaitResult {
                 self.lsense = !self.lsense;
