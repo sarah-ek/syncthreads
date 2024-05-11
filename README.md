@@ -17,7 +17,7 @@ for i in 0..n / 2 {
 }
 ```
 
-Multithreaded code using [`Barrier`].
+Multithreaded code using `Barrier`.
 ```rust
 use syncthreads::{iter, sync_blocking, BarrierInit};
 let n = 1000;
