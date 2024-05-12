@@ -1,7 +1,6 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use crossbeam::queue::SegQueue;
-use reborrow::*;
 use std::{
     future::Future,
     pin::Pin,
@@ -625,39 +624,3 @@ impl_ada_barrier!(AdaBarrier);
 impl_ada_barrier!(AdaBarrierRef<'_>);
 impl_barrier!(Barrier);
 impl_barrier!(BarrierRef<'_>);
-
-impl<'short> ReborrowMut<'short> for BarrierRef<'_> {
-    type Target = BarrierRef<'short>;
-
-    #[inline]
-    fn rb_mut(&'short mut self) -> Self::Target {
-        BarrierRef {
-            init: self.init,
-            lsense: self.lsense,
-        }
-    }
-}
-
-impl<'short> ReborrowMut<'short> for AdaBarrierRef<'_> {
-    type Target = AdaBarrierRef<'short>;
-
-    #[inline]
-    fn rb_mut(&'short mut self) -> Self::Target {
-        AdaBarrierRef {
-            init: self.init,
-            lsense: self.lsense,
-        }
-    }
-}
-
-impl<'short> ReborrowMut<'short> for AsyncBarrierRef<'_> {
-    type Target = AsyncBarrierRef<'short>;
-
-    #[inline]
-    fn rb_mut(&'short mut self) -> Self::Target {
-        AsyncBarrierRef {
-            init: self.init,
-            lsense: self.lsense,
-        }
-    }
-}
