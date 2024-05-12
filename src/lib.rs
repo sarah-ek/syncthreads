@@ -511,26 +511,6 @@ macro_rules! sync_blocking {
     }};
 }
 
-/// Safe wrapper around [`AsyncBarrier::map`].
-#[macro_export]
-macro_rules! map_await {
-    ($bar: expr, $f:expr) => {{
-        #[allow(unused_unsafe)]
-        let x = unsafe { ($bar).map($f, || {}).await };
-        x
-    }};
-}
-
-/// Safe wrapper around [`Barrier::map_blocking`].
-#[macro_export]
-macro_rules! map_blocking {
-    ($bar: expr, $f:expr) => {{
-        #[allow(unused_unsafe)]
-        let x = unsafe { ($bar).map_blocking($f, || {}) };
-        x
-    }};
-}
-
 mod pretty {
     use core::fmt;
 
