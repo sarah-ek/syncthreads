@@ -462,43 +462,60 @@ impl AsyncBarrierRef<'_> {
 
             AsyncBarrierWaitResult::Leader
         } else {
-            struct Wait<'a> {
+            struct Wait<'a, F> {
                 gsense: &'a AtomicUsize,
                 done: &'a AtomicBool,
                 lsense: bool,
                 wakers: &'a SegQueue<Waker>,
-                iters: usize,
+                iters: &'a mut usize,
                 params: &'a AsyncBarrierParams,
+                yield_fut: F,
             }
 
-            impl Future for Wait<'_> {
-                type Output = bool;
+            enum WaitResult {
+                Follower,
+                Dropped,
+                Spurious,
+            }
+
+            impl<F: Future<Output = ()>> Future for Wait<'_, F> {
+                type Output = WaitResult;
 
                 fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                     let lsense = self.lsense as usize;
                     let mut done = self.done.load(SeqCst);
                     let mut gsense = self.gsense.load(SeqCst);
-                    let iter = self.iters;
-                    self.iters += 1;
+                    let iter = *self.iters;
+                    unsafe { *self.as_mut().get_unchecked_mut().iters += 1 };
 
                     if iter < self.params.spin_iters_before_park.0 {
                         if gsense >> SHIFT != lsense {
                             if done {
-                                Poll::Ready(true)
+                                Poll::Ready(WaitResult::Dropped)
                             } else {
                                 if iter >= DEFAULT_SPIN_ITERS_BEFORE_SLEEPY {
-                                    std::thread::yield_now();
+                                    let fut = unsafe {
+                                        Pin::new_unchecked(
+                                            &mut self.as_mut().get_unchecked_mut().yield_fut,
+                                        )
+                                    };
+                                    match fut.poll(cx) {
+                                        Poll::Ready(()) => {
+                                            return Poll::Ready(WaitResult::Spurious)
+                                        }
+                                        Poll::Pending => {}
+                                    }
                                 }
                                 cx.waker().wake_by_ref();
                                 Poll::Pending
                             }
                         } else {
-                            Poll::Ready(false)
+                            Poll::Ready(WaitResult::Follower)
                         }
                     } else {
                         loop {
                             if gsense >> SHIFT == lsense {
-                                return Poll::Ready(false);
+                                return Poll::Ready(WaitResult::Follower);
                             }
 
                             match self.gsense.compare_exchange_weak(
@@ -509,7 +526,7 @@ impl AsyncBarrierRef<'_> {
                             ) {
                                 Ok(_) => {
                                     if done {
-                                        return Poll::Ready(true);
+                                        return Poll::Ready(WaitResult::Dropped);
                                     }
                                     self.wakers.push(cx.waker().clone());
                                     return Poll::Pending;
@@ -524,19 +541,24 @@ impl AsyncBarrierRef<'_> {
                 }
             }
 
-            if (Wait {
-                gsense: &self.init.gsense,
-                done: &self.init.done,
-                lsense,
-                wakers,
-                iters: 0,
-                params: &self.init.params,
-            }
-            .await)
-            {
-                AsyncBarrierWaitResult::Dropped
-            } else {
-                AsyncBarrierWaitResult::Follower
+            let iters = &mut 0;
+
+            loop {
+                match (Wait {
+                    gsense: &self.init.gsense,
+                    done: &self.init.done,
+                    lsense,
+                    wakers,
+                    iters,
+                    params: &self.init.params,
+                    yield_fut: tokio::task::yield_now(),
+                }
+                .await)
+                {
+                    WaitResult::Follower => return AsyncBarrierWaitResult::Follower,
+                    WaitResult::Dropped => return AsyncBarrierWaitResult::Dropped,
+                    WaitResult::Spurious => {}
+                }
             }
         }
     }
@@ -555,34 +577,47 @@ impl AsyncBarrierRef<'_> {
 
     #[inline(never)]
     pub async fn follow(&self) {
-        struct Wait<'a> {
+        struct Wait<'a, F> {
             waiting_for_leader: &'a AtomicUsize,
             wakers: &'a SegQueue<Waker>,
-            iters: usize,
+            iters: &'a mut usize,
             params: &'a AsyncBarrierParams,
+            yield_fut: F,
         }
 
-        impl Future for Wait<'_> {
-            type Output = ();
+        enum WaitResult {
+            Advance,
+            Spurious,
+        }
+
+        impl<F: Future<Output = ()>> Future for Wait<'_, F> {
+            type Output = WaitResult;
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let iter = self.iters;
-                self.iters += 1;
+                let iter = *self.iters;
+                unsafe { *self.as_mut().get_unchecked_mut().iters += 1 };
+
                 let mut waiting_for_leader = self.waiting_for_leader.load(SeqCst);
                 if iter < self.params.spin_iters_before_park.0 {
                     if waiting_for_leader >> SHIFT == 1 {
                         if iter >= DEFAULT_SPIN_ITERS_BEFORE_SLEEPY {
-                            std::thread::yield_now();
+                            let fut = unsafe {
+                                Pin::new_unchecked(&mut self.as_mut().get_unchecked_mut().yield_fut)
+                            };
+                            match fut.poll(cx) {
+                                Poll::Ready(()) => return Poll::Ready(WaitResult::Spurious),
+                                Poll::Pending => {}
+                            }
                         }
                         cx.waker().wake_by_ref();
                         Poll::Pending
                     } else {
-                        Poll::Ready(())
+                        Poll::Ready(WaitResult::Advance)
                     }
                 } else {
                     loop {
                         if waiting_for_leader >> SHIFT == 0 {
-                            return Poll::Ready(());
+                            return Poll::Ready(WaitResult::Advance);
                         }
 
                         match self.waiting_for_leader.compare_exchange_weak(
@@ -604,13 +639,21 @@ impl AsyncBarrierRef<'_> {
 
         let lsense = self.lsense;
         let wakers = &self.init.follow_wakers[lsense as usize];
-        Wait {
-            waiting_for_leader: &self.init.waiting_for_leader,
-            iters: 0,
-            wakers,
-            params: &self.init.params,
+        let iters = &mut 0;
+        loop {
+            match (Wait {
+                waiting_for_leader: &self.init.waiting_for_leader,
+                iters,
+                wakers,
+                params: &self.init.params,
+                yield_fut: tokio::task::yield_now(),
+            }
+            .await)
+            {
+                WaitResult::Advance => return,
+                WaitResult::Spurious => {}
+            }
         }
-        .await;
     }
 }
 

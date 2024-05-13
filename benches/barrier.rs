@@ -1,8 +1,10 @@
 use core_affinity::CoreId;
 use diol::prelude::*;
+use futures::Future;
 use rayon::prelude::*;
-use std::sync::atomic::AtomicUsize;
+use std::{pin::Pin, sync::atomic::AtomicUsize};
 use syncthreads::{AllocHint, AsyncBarrierInit, BarrierInit};
+use tokio::task::JoinSet;
 
 fn sequential(bencher: Bencher, PlotArg(n): PlotArg) {
     let x = &mut *vec![1.0; n];
@@ -111,9 +113,10 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
     bencher.bench(|| {
         let init =
             AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), Default::default());
-        tokio_scoped::scoped(runtime.handle()).scope(|scope| {
+        runtime.block_on(async {
+            let mut set = JoinSet::new();
             for _ in 0..nthreads {
-                scope.spawn(async {
+                let task = async {
                     let mut barrier = init.barrier_ref();
 
                     for i in 0..n / 2 {
@@ -131,7 +134,15 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
                             *x += head;
                         }
                     }
-                });
+                };
+
+                let task: Pin<Box<dyn Future<Output = ()> + Send + Sync + '_>> = Box::pin(task);
+                let task: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>> =
+                    unsafe { core::mem::transmute(task) };
+                set.spawn(task);
+            }
+            for _ in 0..nthreads {
+                set.join_next().await;
             }
         });
     })

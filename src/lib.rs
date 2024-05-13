@@ -171,6 +171,7 @@ impl<T> core::ops::DerefMut for Guard<'_, T> {
 }
 
 impl<T> Shared<T> {
+    /// Creates a new instance protecting the given value.
     #[inline]
     pub fn new(value: T) -> Self {
         Self {
@@ -179,6 +180,20 @@ impl<T> Shared<T> {
         }
     }
 
+    /// Returns a mutable reference to the protected value.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
+    /// Consumes `self` to return the protected value.
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
+
+    /// Returns mutable access to the inner value if it is already taken.
+    ///
+    /// # Panics
+    /// Panics if the value is already borrowed by a previous call to `lock`.
     #[inline]
     pub fn lock(&self) -> Guard<'_, T> {
         let taken = self
@@ -270,6 +285,11 @@ impl<T> BarrierInit<T> {
         )
     }
 
+    /// Returns a mutable reference to the protected value.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
     /// Creates a new barrier referencing `self`.
     ///
     /// # Panics
@@ -327,6 +347,11 @@ impl<T> AsyncBarrierInit<T> {
                 }),
             },
         )
+    }
+
+    /// Returns a mutable reference to the protected value.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
     }
 
     /// Creates a new barrier referencing `self`.
@@ -479,7 +504,7 @@ impl<'a, T> AsyncBarrier<'a, T> {
 
     /// Returns the number of threads the barriers need to wait for.
     #[inline]
-    pub fn thread_count(&self) -> usize {
+    pub fn num_threads(&self) -> usize {
         self.inner.num_threads()
     }
 }
