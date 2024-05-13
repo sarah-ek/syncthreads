@@ -1,7 +1,5 @@
 use aligned_vec::AVec;
-use core::cell::UnsafeCell;
-use core::fmt;
-use core::mem::MaybeUninit;
+use core::{cell::UnsafeCell, fmt, mem::MaybeUninit};
 use equator::assert;
 
 pub struct DynVec {
