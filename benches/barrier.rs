@@ -1,17 +1,15 @@
 use core_affinity::CoreId;
 use diol::prelude::*;
-use futures::Future;
 use rayon::prelude::*;
-use std::{pin::Pin, sync::atomic::AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use syncthreads::{AllocHint, AsyncBarrierInit, BarrierInit};
-use tokio::task::JoinSet;
 
 fn sequential(bencher: Bencher, PlotArg(n): PlotArg) {
     let x = &mut *vec![1.0; n];
 
     bencher.bench(|| {
         x.fill(1.0);
-        for i in 0..n / 2 {
+        for i in 0..n {
             let head = x[i];
 
             x[i + 1..].iter_mut().for_each(|x| {
@@ -26,7 +24,7 @@ fn rayon(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        for i in 0..n / 2 {
+        for i in 0..n {
             let head = x[i];
 
             x[i + 1..].par_iter_mut().for_each(|x| {
@@ -42,7 +40,7 @@ fn rayon_chunk(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        for i in 0..n / 2 {
+        for i in 0..n {
             let head = x[i];
             let len = x[i + 1..].len();
 
@@ -72,8 +70,8 @@ fn barrier(bencher: Bencher, PlotArg(n): PlotArg) {
                 s.spawn(|_| {
                     let mut barrier = init.barrier_ref();
 
-                    for i in 0..n / 2 {
-                        let Ok((head, mine)) = syncthreads::sync_blocking!(barrier, |x| {
+                    for i in 0..n {
+                        let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], syncthreads::iter::split_mut(x, nthreads))
                         }) else {
@@ -97,6 +95,7 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
 
     static TID: AtomicUsize = AtomicUsize::new(0);
+    TID.store(0, std::sync::atomic::Ordering::Relaxed);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(nthreads)
         .on_thread_start(|| {
@@ -106,24 +105,24 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
         })
         .build()
         .unwrap();
-    runtime.spawn(async {});
 
     let x = &mut *vec![1.0; n];
 
     bencher.bench(|| {
         let init =
             AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), Default::default());
-        runtime.block_on(async {
-            let mut set = JoinSet::new();
+        tokio_scoped::scoped(runtime.handle()).scope(|scope| {
             for _ in 0..nthreads {
-                let task = async {
+                scope.spawn(async {
                     let mut barrier = init.barrier_ref();
 
-                    for i in 0..n / 2 {
-                        let Ok((head, mine)) = syncthreads::sync_await!(barrier, |x| {
+                    for i in 0..n {
+                        let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], syncthreads::iter::split_mut(x, nthreads))
-                        }) else {
+                        })
+                        .await
+                        else {
                             break;
                         };
 
@@ -134,15 +133,7 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
                             *x += head;
                         }
                     }
-                };
-
-                let task: Pin<Box<dyn Future<Output = ()> + Send + Sync + '_>> = Box::pin(task);
-                let task: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>> =
-                    unsafe { core::mem::transmute(task) };
-                set.spawn(task);
-            }
-            for _ in 0..nthreads {
-                set.join_next().await;
+                });
             }
         });
     })
@@ -159,8 +150,8 @@ fn main() -> std::io::Result<()> {
 
     let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register_many(
-        list![async_barrier, barrier, rayon, rayon_chunk, sequential],
-        [1_000, 10_000, 100_000, 400_000].map(PlotArg),
+        list![sequential, rayon, rayon_chunk, barrier, async_barrier],
+        [10_000, 100_000, 400_000].map(PlotArg),
     );
     bench.run()?;
 

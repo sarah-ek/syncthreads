@@ -20,7 +20,7 @@
 //!
 //! Multithreaded code using [`Barrier`].
 //! ```
-//! use syncthreads::{iter, sync_blocking, BarrierInit};
+//! use syncthreads::{iter, sync, BarrierInit};
 //!
 //! let n = 1000;
 //! let x = &mut *vec![1.0; n];
@@ -32,7 +32,7 @@
 //!             let mut barrier = init.barrier_ref();
 //!
 //!             for i in 0..n / 2 {
-//!                 let Ok((head, data)) = sync_blocking!(barrier, |x| {
+//!                 let Ok((head, data)) = sync!(barrier, |x| {
 //!                     let (head, x) = x[i..].split_at_mut(1);
 //!
 //!                     (head[0], iter::split_mut(x, nthreads))
@@ -393,12 +393,7 @@ impl<'a, T> Barrier<'a, T> {
     /// # Safety
     /// Threads from the same group that wait at this function at the same time must agree on the
     /// same types for `Shared`, `Exclusive`, and the type of `tag`.
-    pub unsafe fn sync_blocking<
-        'b,
-        Shared: Sync,
-        Exclusive: Send,
-        I: IntoIterator<Item = Exclusive>,
-    >(
+    pub unsafe fn sync<'b, Shared: Sync, Exclusive: Send, I: IntoIterator<Item = Exclusive>>(
         &'b mut self,
         f: impl FnOnce(&'a mut T) -> (Shared, I),
         tag: impl core::any::Any,
@@ -516,22 +511,12 @@ fn type_id_of_val<T: 'static>(_: &T) -> pretty::TypeId {
     }
 }
 
-/// Safe wrapper around [`AsyncBarrier::sync`].
+/// Safe wrapper around [`AsyncBarrier::sync`] and [`Barrier::sync`].
 #[macro_export]
-macro_rules! sync_await {
+macro_rules! sync {
     ($bar: expr, $f:expr) => {{
         #[allow(unused_unsafe)]
-        let x = unsafe { ($bar).sync($f, || {}).await };
-        x
-    }};
-}
-
-/// Safe wrapper around [`Barrier::sync_blocking`].
-#[macro_export]
-macro_rules! sync_blocking {
-    ($bar: expr, $f:expr) => {{
-        #[allow(unused_unsafe)]
-        let x = unsafe { ($bar).sync_blocking($f, || {}) };
+        let x = unsafe { ($bar).sync($f, || {}) };
         x
     }};
 }
@@ -593,7 +578,7 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Ok((head, data)) = sync_blocking!(barrier, |x| {
+                                let Ok((head, data)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
 
                                     (head[0], iter::split_mut(x, nthreads))
@@ -641,7 +626,7 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Ok((&head, mine)) = sync_blocking!(barrier, |x| {
+                                let Ok((&head, mine)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
@@ -738,7 +723,7 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Ok((head, mine)) = sync_blocking!(barrier, |x| {
+                                let Ok((head, mine)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
@@ -839,10 +824,12 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Ok((head, mine)) = sync_await!(barrier, |x| {
+                                let Ok((head, mine)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
                                     (head[0], iter::split_mut(x, nthreads))
-                                }) else {
+                                })
+                                .await
+                                else {
                                     panic!();
                                 };
 
@@ -877,10 +864,12 @@ mod tests {
                     let mut barrier = init.barrier_ref();
 
                     for i in 0..n / 2 {
-                        let Ok((head, mine)) = sync_await!(barrier, |x| {
+                        let Ok((head, mine)) = sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], iter::split_mut(x, nthreads))
-                        }) else {
+                        })
+                        .await
+                        else {
                             panic!();
                         };
 
@@ -915,10 +904,12 @@ mod tests {
 
                     for i in 0..n / 2 {
                         if barrier.thread_id() == 0 {
-                            let Ok((head, mine)) = sync_await!(barrier, |x| {
+                            let Ok((head, mine)) = sync!(barrier, |x| {
                                 let (head, x) = x[i..].split_at_mut(1);
                                 (head[0], iter::split_mut(x, nthreads))
-                            }) else {
+                            })
+                            .await
+                            else {
                                 panic!();
                             };
 
@@ -929,10 +920,12 @@ mod tests {
                                 *x += head;
                             }
                         } else {
-                            let Ok((head, mine)) = sync_await!(barrier, |x| {
+                            let Ok((head, mine)) = sync!(barrier, |x| {
                                 let (head, x) = x[i..].split_at_mut(1);
                                 (head[0], iter::split_mut(x, nthreads))
-                            }) else {
+                            })
+                            .await
+                            else {
                                 panic!();
                             };
 
