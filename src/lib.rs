@@ -32,16 +32,14 @@
 //!             let mut barrier = init.barrier_ref();
 //!
 //!             for i in 0..n / 2 {
-//!                 let Ok((head, data)) = sync!(barrier, |x| {
+//!                 let (head, mine) = sync!(barrier, |x| {
 //!                     let (head, x) = x[i..].split_at_mut(1);
 //!
 //!                     (head[0], iter::split_mut(x, nthreads))
-//!                 }) else {
-//!                     panic!();
-//!                 };
+//!                 })
+//!                 .unwrap();
 //!
 //!                 let head = *head;
-//!                 let mine = &mut **data;
 //!
 //!                 for x in mine.iter_mut() {
 //!                     *x += head;
@@ -57,6 +55,7 @@
 //! ```
 use core::{cell::UnsafeCell, fmt, sync::atomic::AtomicUsize};
 use crossbeam::utils::CachePadded;
+use equator::assert;
 use std::sync::atomic::AtomicBool;
 
 extern crate alloc;
@@ -199,7 +198,7 @@ impl<T> Shared<T> {
         let taken = self
             .taken
             .fetch_or(true, std::sync::atomic::Ordering::Relaxed);
-        equator::assert!(!taken);
+        assert!(!taken);
         Guard {
             taken: &self.taken,
             value: unsafe { &mut *self.value.get() },
@@ -395,9 +394,9 @@ impl<'a, T> Barrier<'a, T> {
     /// same types for `Shared`, `Exclusive`, and the type of `tag`.
     pub unsafe fn sync<'b, Shared: Sync, Exclusive: Send, I: IntoIterator<Item = Exclusive>>(
         &'b mut self,
-        f: impl FnOnce(&'a mut T) -> (Shared, I),
+        f: impl FnOnce(&'b mut T) -> (Shared, I),
         tag: impl core::any::Any,
-    ) -> Result<(&'b Shared, &'b mut Exclusive), DropError> {
+    ) -> Result<(&'b Shared, Exclusive), DropError> {
         let tag = type_id_of_val(&tag);
         match self.inner.wait() {
             sync::BarrierWaitResult::Leader => {
@@ -406,7 +405,18 @@ impl<'a, T> Barrier<'a, T> {
 
                 let f = f(unsafe { &mut *self.data.get() });
                 shared.collect(core::iter::once(f.0));
-                exclusive.collect(f.1.into_iter().map(UnsafeCell::new).map(CachePadded::new));
+                let mut iter = f.1.into_iter();
+                exclusive.collect(
+                    (&mut iter)
+                        .take(self.num_threads())
+                        .map(Some)
+                        .map(UnsafeCell::new)
+                        .map(CachePadded::new),
+                );
+                assert!(all(
+                    exclusive.len == self.num_threads(),
+                    iter.next().is_none(),
+                ));
                 unsafe { *self.tag.get() = tag };
                 self.inner.lead();
             }
@@ -416,15 +426,17 @@ impl<'a, T> Barrier<'a, T> {
             sync::BarrierWaitResult::Dropped => return Err(DropError),
         }
         let self_tag = unsafe { *self.tag.get() };
-        equator::assert!(tag == self_tag);
+        assert!(tag == self_tag);
 
         Ok((
             unsafe { &(&*self.shared.get()).assume_ref::<Shared>()[0] },
-            unsafe {
-                &mut *((&*self.exclusive.get()).assume_ref::<CachePadded<UnsafeCell<Exclusive>>>()
-                    [self.tid]
+            (unsafe {
+                &mut *((&*self.exclusive.get())
+                    .assume_ref::<CachePadded<UnsafeCell<Option<Exclusive>>>>()[self.tid]
                     .get())
-            },
+            })
+            .take()
+            .unwrap(),
         ))
     }
 
@@ -458,9 +470,9 @@ impl<'a, T> AsyncBarrier<'a, T> {
         I: IntoIterator<Item = Exclusive>,
     >(
         &'b mut self,
-        f: impl FnOnce(&'a mut T) -> (Shared, I),
+        f: impl FnOnce(&'b mut T) -> (Shared, I),
         tag: impl core::any::Any,
-    ) -> Result<(&'b Shared, &'b mut Exclusive), DropError> {
+    ) -> Result<(&'b Shared, Exclusive), DropError> {
         let tag = type_id_of_val(&tag);
         match self.inner.wait().await {
             sync::AsyncBarrierWaitResult::Leader => {
@@ -469,7 +481,18 @@ impl<'a, T> AsyncBarrier<'a, T> {
 
                 let f = f(unsafe { &mut *self.data.get() });
                 shared.collect(core::iter::once(f.0));
-                exclusive.collect(f.1.into_iter().map(UnsafeCell::new).map(CachePadded::new));
+                let mut iter = f.1.into_iter();
+                exclusive.collect(
+                    (&mut iter)
+                        .take(self.num_threads())
+                        .map(Some)
+                        .map(UnsafeCell::new)
+                        .map(CachePadded::new),
+                );
+                assert!(all(
+                    exclusive.len == self.num_threads(),
+                    iter.next().is_none(),
+                ));
                 unsafe { *self.tag.get() = tag };
                 self.inner.lead();
             }
@@ -480,14 +503,19 @@ impl<'a, T> AsyncBarrier<'a, T> {
         }
 
         let self_tag = unsafe { *self.tag.get() };
-        equator::assert!(tag == self_tag);
+        assert!(tag == self_tag);
 
         let shared = &unsafe { (&*self.shared.get()).assume_ref::<Shared>() }[0];
-        Ok((shared, unsafe {
-            &mut *((&*self.exclusive.get()).assume_ref::<CachePadded<UnsafeCell<Exclusive>>>()
-                [self.tid]
-                .get())
-        }))
+        Ok((
+            shared,
+            (unsafe {
+                &mut *((&*self.exclusive.get())
+                    .assume_ref::<CachePadded<UnsafeCell<Option<Exclusive>>>>()[self.tid]
+                    .get())
+            })
+            .take()
+            .unwrap(),
+        ))
     }
 
     /// Returns the unique (among the barriers created by the same initializer) id of `self`, which
@@ -578,16 +606,13 @@ mod tests {
                             let mut barrier = init.barrier_ref();
 
                             for i in 0..n / 2 {
-                                let Ok((head, data)) = sync!(barrier, |x| {
+                                let Ok((head, mine)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
 
                                     (head[0], iter::split_mut(x, nthreads))
                                 }) else {
                                     panic!();
                                 };
-
-                                let head = *head;
-                                let mine = &mut **data;
 
                                 for x in mine.iter_mut() {
                                     *x += head;
@@ -632,7 +657,6 @@ mod tests {
                                 }) else {
                                     panic!();
                                 };
-                                let mine = &mut **mine;
                                 for x in mine.iter_mut() {
                                     *x += head;
                                 }
@@ -729,9 +753,6 @@ mod tests {
                                 }) else {
                                     panic!();
                                 };
-
-                                let head = *head;
-                                let mine = &mut **mine;
 
                                 for x in mine.iter_mut() {
                                     *x += head;
@@ -833,9 +854,6 @@ mod tests {
                                     panic!();
                                 };
 
-                                let head = *head;
-                                let mine = &mut **mine;
-
                                 for x in mine.iter_mut() {
                                     *x += head;
                                 }
@@ -872,9 +890,6 @@ mod tests {
                         else {
                             panic!();
                         };
-
-                        let head = *head;
-                        let mine = &mut **mine;
 
                         for x in mine.iter_mut() {
                             *x += head;
@@ -913,9 +928,6 @@ mod tests {
                                 panic!();
                             };
 
-                            let head = *head;
-                            let mine = &mut **mine;
-
                             for x in mine.iter_mut() {
                                 *x += head;
                             }
@@ -928,9 +940,6 @@ mod tests {
                             else {
                                 panic!();
                             };
-
-                            let head = *head;
-                            let mine = &mut **mine;
 
                             for x in mine.iter_mut() {
                                 *x += head;

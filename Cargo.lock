@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "syncthreads"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aligned-vec",
  "core_affinity",
